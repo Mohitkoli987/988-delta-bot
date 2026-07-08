@@ -4213,8 +4213,8 @@ _break_even_applied      = {}
 _break_even_applied_lock = Lock()
 
 # ========== TP/SL GUARDIAN CONFIG ==========
-LIVE_TP_PERCENTAGE        = 4
-LIVE_SL_PERCENTAGE        = 2
+LIVE_TP_PERCENTAGE        = 1
+LIVE_SL_PERCENTAGE        = 1
 LIQUIDATION_PROTECTION    = "Y"
 # LIQUIDATION_BUFFER        = 0.15
 LIQUIDATION_BUFFER        = 0.1
@@ -4223,7 +4223,7 @@ LIQUIDATION_BUFFER        = 0.1
 BREAK_EVEN_ENABLED         = True
 BREAK_EVEN_TRIGGER_PERCENT = 0.5    # TP ka kitna % travel hone pe BE activate ho
 BREAK_EVEN_TRIGGER_BUFFER  = 0.4    # Half-TP se itna pehle trigger ho (USD)
-BREAK_EVEN_PROFIT_OFFSET   = 3      # Entry ke upar SL kitna rakho (USD)
+BREAK_EVEN_PROFIT_OFFSET   = 3.5      # Entry ke upar SL kitna rakho (USD)
 
 # ========== BREAK-EVEN STATE TRACKER ==========
 # key = product_id, value = be_new_sl price (float) or None
