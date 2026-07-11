@@ -4214,6 +4214,24 @@ def delete_trades():
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
+@app.route('/api/clear-all-trades', methods=['POST'])
+def clear_all_trades():
+    try:
+        execute_mysql_query('DELETE FROM closed_positions', commit=True)
+        return jsonify({'success': True, 'message': 'Successfully cleared all trade history'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+
+@app.route('/api/clear-all-signal-scores', methods=['POST'])
+def clear_all_signal_scores():
+    try:
+        execute_mysql_query('DELETE FROM signal_scores_history', commit=True)
+        return jsonify({'success': True, 'message': 'Successfully cleared all signal scores history'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+
 
 
 # _break_even_applied_lock ADD karo

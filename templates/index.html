@@ -937,6 +937,7 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn btn-outline" style="padding:5px 12px;font-size:9px;height:auto;min-height:28px;letter-spacing:1px" onclick="openFullHistory()">📋 VIEW FULL LIST</button>
         <button id="deleteSelectedBtn" class="btn btn-outline" style="padding:5px 10px;font-size:9px;height:auto;min-height:28px" onclick="deleteSelectedTrades()" disabled>Delete Selected</button>
+        <button class="btn btn-outline btn-amber" style="padding:5px 10px;font-size:9px;height:auto;min-height:28px" onclick="clearAllTrades()">🗑️ CLEAR ALL</button>
       </div>
     </div>
     <div class="pnl-banner">
@@ -970,7 +971,10 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
   <div class="card">
     <div class="card-head">
       <span class="card-head-title">Signal Scores History (Info Only)</span>
-      <span id="ssHistInfo" style="font-family:var(--font-mono);font-size:9px;color:var(--muted)">—</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="ssHistInfo" style="font-family:var(--font-mono);font-size:9px;color:var(--muted)">—</span>
+        <button class="btn btn-outline btn-amber" style="padding:5px 10px;font-size:9px;height:auto;min-height:28px" onclick="clearAllSignalScores()">🗑️ CLEAR ALL</button>
+      </div>
     </div>
     <div class="table-scroll">
       <table>
@@ -1811,6 +1815,50 @@ function loadNextSignalScores(){
     ssManualPage = true;
     loadSignalScoresPage(ssCurrentPage + 1);
     setTimeout(()=>{ssManualPage=false}, 4000);
+  }
+}
+
+async function clearAllTrades() {
+  if(!confirm('Are you sure you want to clear ALL trade history? This cannot be undone.')) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/clear-all-trades', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'}
+    });
+    const data = await res.json();
+    if(data.success) {
+      alert(data.message);
+      await loadTradesPage(1);
+      await buildGraphFromDB();
+      modalLoaded = false;
+    } else {
+      alert(data.message);
+    }
+  } catch(e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function clearAllSignalScores() {
+  if(!confirm('Are you sure you want to clear ALL signal scores history? This cannot be undone.')) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/clear-all-signal-scores', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'}
+    });
+    const data = await res.json();
+    if(data.success) {
+      alert(data.message);
+      await loadSignalScoresPage(1);
+    } else {
+      alert(data.message);
+    }
+  } catch(e) {
+    alert('Error: ' + e.message);
   }
 }
 
