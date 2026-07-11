@@ -4225,12 +4225,12 @@ LIVE_TP_PERCENTAGE        = 2
 LIVE_SL_PERCENTAGE        = 1
 LIQUIDATION_PROTECTION    = "Y"
 # LIQUIDATION_BUFFER        = 0.15
-LIQUIDATION_BUFFER        = 0.1
+LIQUIDATION_BUFFER        = 0.2
 
 # ========== BREAK-EVEN CONFIG ==========
 BREAK_EVEN_ENABLED         = True
 BREAK_EVEN_TRIGGER_PERCENT = 0.5    # TP ka kitna % travel hone pe BE activate ho
-BREAK_EVEN_TRIGGER_BUFFER  = 0.4    # Half-TP se itna pehle trigger ho (USD)
+BREAK_EVEN_TRIGGER_BUFFER  = 4    # Half-TP se itna pehle trigger ho (USD)
 BREAK_EVEN_PROFIT_OFFSET   = 3.5      # Entry ke upar SL kitna rakho (USD)
 
 # ========== BREAK-EVEN STATE TRACKER ==========
@@ -4596,7 +4596,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
             "id":         order_id_be,
             "product_id": int(product_id),
             "order_type": "market_order",
-            "stop_price": "{:.6f}".format(be_new_sl),
+            "stop_price": "{:.2f}".format(be_new_sl),
             "size":       abs(int(size))
         }
         edit_body = json.dumps(edit_payload)
@@ -4627,7 +4627,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
             "product_id": int(product_id),
             "stop_loss_order": {
                 "order_type": "market_order",
-                "stop_price": "{:.6f}".format(be_new_sl)
+                "stop_price": "{:.2f}".format(be_new_sl)
             }
         }
         body_be = json.dumps(payload_be)
