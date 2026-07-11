@@ -478,6 +478,14 @@ def init_database():
         raise
 
 
+#decimals ke liye ek extra fuction
+def round_price_2dp(price):
+    """Only for TP/SL/bracket stop prices sent to exchange. NOT used for PnL math."""
+    try:
+        return float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return round(float(price), 2)
+
 # ========== PERSISTENT STATE FUNCTIONS ==========
 def save_bot_state_to_db():
     try:
@@ -4213,7 +4221,7 @@ _break_even_applied      = {}
 _break_even_applied_lock = Lock()
 
 # ========== TP/SL GUARDIAN CONFIG ==========
-LIVE_TP_PERCENTAGE        = 1
+LIVE_TP_PERCENTAGE        = 2
 LIVE_SL_PERCENTAGE        = 1
 LIQUIDATION_PROTECTION    = "Y"
 # LIQUIDATION_BUFFER        = 0.15
@@ -4288,6 +4296,11 @@ def auto_tp_sl_guardian():
                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
 
+                    
+
+                    expected_tp = round_price_2dp(expected_tp)
+                    expected_sl = round_price_2dp(expected_sl)
+
                     final_sl = expected_sl
 
                     # ── Liquidation protection ────────────────────────────
@@ -4298,7 +4311,7 @@ def auto_tp_sl_guardian():
                                 liquidation_price = float(liquidation_price_raw)
                                 if size > 0:
                                     if expected_sl <= liquidation_price:
-                                        final_sl = liquidation_price + LIQUIDATION_BUFFER
+                                        final_sl = round_price_2dp(liquidation_price + LIQUIDATION_BUFFER)
                                         log_system(
                                             f"[LIQ PROTECT] LONG {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/below "
@@ -4307,7 +4320,7 @@ def auto_tp_sl_guardian():
                                         )
                                 else:
                                     if expected_sl >= liquidation_price:
-                                        final_sl = liquidation_price - LIQUIDATION_BUFFER
+                                        final_sl = round_price_2dp(liquidation_price - LIQUIDATION_BUFFER)
                                         log_system(
                                             f"[LIQ PROTECT] SHORT {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/above "
@@ -4362,8 +4375,8 @@ def auto_tp_sl_guardian():
                                 if size > 0:  # LONG
                                     tp_distance   = expected_tp - entry
                                     half_distance = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
-                                    be_trigger    = entry + half_distance - BREAK_EVEN_TRIGGER_BUFFER
-                                    be_new_sl     = entry + BREAK_EVEN_PROFIT_OFFSET
+                                    be_trigger    = round_price_2dp(entry + half_distance - BREAK_EVEN_TRIGGER_BUFFER)
+                                    be_new_sl     = round_price_2dp(entry + BREAK_EVEN_PROFIT_OFFSET)
 
                                     # DEBUG LOG — throttled to once per 10s per position (FIX: was
                                     # logging every 2s forever -> disk growth over many days)
@@ -4387,8 +4400,8 @@ def auto_tp_sl_guardian():
                                 else:  # SHORT
                                     tp_distance   = entry - expected_tp
                                     half_distance = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
-                                    be_trigger    = entry - half_distance + BREAK_EVEN_TRIGGER_BUFFER
-                                    be_new_sl     = entry - BREAK_EVEN_PROFIT_OFFSET
+                                    be_trigger    = round_price_2dp(entry - half_distance + BREAK_EVEN_TRIGGER_BUFFER)
+                                    be_new_sl     = round_price_2dp(entry - BREAK_EVEN_PROFIT_OFFSET)
 
                                     # DEBUG LOG — throttled (see note above)
                                     log_throttled(
@@ -4460,7 +4473,7 @@ def auto_tp_sl_guardian():
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(expected_tp),
+                                "stop_price": "{:.2f}".format(expected_tp),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -4486,7 +4499,7 @@ def auto_tp_sl_guardian():
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(final_sl),
+                                "stop_price": "{:.2f}".format(final_sl),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -4532,11 +4545,11 @@ def auto_tp_sl_guardian():
                             "product_id": int(product_id),
                             "take_profit_order": {
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(expected_tp)
+                                "stop_price": "{:.2f}".format(expected_tp)
                             },
                             "stop_loss_order": {
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(final_sl)
+                                "stop_price": "{:.2f}".format(final_sl)
                             }
                         }
                         body = json.dumps(payload)
@@ -4566,6 +4579,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
     Helper: edit existing SL order to break-even level, or place new bracket SL.
     CHANGE 1: Stores be_new_sl price (float) instead of True in tracker.
     """
+    be_new_sl    = round_price_2dp(be_new_sl)
     orders_be    = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
     sl_orders_be = []
     if orders_be and orders_be.get('success'):
