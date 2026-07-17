@@ -37,3 +37,7 @@ instance/
 
 # Temporary files
 *.tmp
+
+
+# Google Service Account
+*-*.json
