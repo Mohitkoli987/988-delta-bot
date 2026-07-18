@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Google Sheets History</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,400&family=Orbitron:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#020408;
+  --surface:#04080f;
+  --card:rgba(6,12,22,0.92);
+  --border:rgba(0,221,180,0.07);
+  --border2:rgba(0,221,180,0.14);
+  --border3:rgba(0,221,180,0.28);
+  --cyan:#00ddb4;
+  --cyan2:#00ffcc;
+  --cyan3:rgba(0,221,180,0.1);
+  --red:#ff2055;
+  --red2:rgba(255,32,85,0.1);
+  --gold:#ffaa00;
+  --gold2:rgba(255,170,0,0.1);
+  --blue:#00aaff;
+  --blue2:rgba(0,170,255,0.1);
+  --purple:#9933ff;
+  --text:#d0e8f8;
+  --text2:#7090a8;
+  --muted:#3a5060;
+  --font-display:'Orbitron',monospace;
+  --font-ui:'Exo 2',sans-serif;
+  --font-mono:'Share Tech Mono',monospace;
+}
+
+html,body{min-height:100vh;overflow-x:hidden;font-family:var(--font-ui);font-size:14px;background:var(--bg);color:var(--text)}
+
+.app{position:relative;z-index:1;display:flex;flex-direction:column;min-height:100vh}
+
+nav{
+  position:sticky;top:0;z-index:200;
+  height:58px;padding:0 16px;
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(2,4,8,.94);
+  backdrop-filter:blur(24px);
+  border-bottom:1px solid var(--border2);
+}
+
+.nav-brand{display:flex;align-items:center;gap:10px}
+.nav-logo-hex{
+  width:38px;height:38px;position:relative;
+  display:flex;align-items:center;justify-content:center;
+}
+.nav-logo-hex svg{position:absolute;inset:0}
+.nav-logo-letter{
+  font-family:var(--font-display);font-size:15px;font-weight:900;
+  color:var(--bg);position:relative;z-index:1;
+}
+.nav-title{
+  font-family:var(--font-display);font-size:11px;font-weight:700;letter-spacing:3px;
+  background:linear-gradient(90deg,var(--cyan2),var(--blue));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+.nav-sub{font-family:var(--font-mono);font-size:9px;color:var(--muted);letter-spacing:2px}
+
+.nav-right{display:flex;align-items:center;gap:10px}
+.btn{
+  padding:8px 16px;border-radius:8px;
+  font-family:var(--font-display);font-weight:700;font-size:9px;
+  cursor:pointer;border:none;transition:all .2s;
+  letter-spacing:2px;text-transform:uppercase;
+  display:flex;align-items:center;justify-content:center;gap:7px;
+  background:rgba(0,221,180,.05);border:1px solid var(--border2);
+  color:var(--text2);
+}
+.btn:hover{border-color:var(--border3);color:var(--cyan);background:rgba(0,221,180,.08)}
+.btn-primary{
+  background:linear-gradient(135deg,#0033aa,#0066dd,#00aaff);color:#fff;
+  border:1px solid rgba(0,170,255,.3);
+}
+.btn-primary:hover{background:linear-gradient(135deg,#0044cc,#0077ff,#22bbff)}
+
+main{
+  flex:1;padding:16px 14px 100px;
+  display:flex;flex-direction:column;gap:14px;
+  max-width:1200px;margin:0 auto;width:100%;
+}
+
+.card{
+  background:var(--card);
+  border:1px solid var(--border2);
+  border-radius:14px;overflow:hidden;
+  box-shadow:0 4px 24px rgba(0,0,0,.6),inset 0 1px 0 rgba(0,221,180,.06);
+}
+.card-head{
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(0,221,180,.015);
+}
+.card-head-title{
+  font-family:var(--font-display);font-size:8.5px;font-weight:700;
+  color:var(--muted);text-transform:uppercase;letter-spacing:2.5px;
+}
+
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:11px;min-width:900px}
+th{
+  padding:11px 9px;color:var(--muted);
+  font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:1.5px;
+  text-align:left;border-bottom:1px solid var(--border2);font-weight:500;white-space:nowrap;
+  background:rgba(0,221,180,.015);position:sticky;top:0;z-index:2;
+  cursor:pointer;
+}
+th.sortable:hover{color:var(--cyan)}
+th.sort-asc::after{content:' ↑'}
+th.sort-desc::after{content:' ↓'}
+td{padding:12px 9px;border-bottom:1px solid var(--border);white-space:nowrap;font-family:var(--font-mono);font-size:11px;transition:background .15s}
+tr:last-child td{border-bottom:none}
+tr.trade-row-profit td{background:rgba(0,221,180,.035)}
+tr.trade-row-loss td{background:rgba(255,32,85,.03)}
+tr.trade-row-profit:hover td{background:rgba(0,221,180,.065)!important}
+tr.trade-row-loss:hover td{background:rgba(255,32,85,.06)!important}
+tr:hover td{background:rgba(0,221,180,.02)}
+
+.side-buy{color:var(--cyan2);font-weight:700}
+.side-sell{color:var(--red);font-weight:700}
+.pnl-p{color:var(--cyan2);font-weight:700}
+.pnl-n{color:var(--red);font-weight:700}
+
+.filters{
+  display:flex;gap:8px;align-items:center;
+  padding:12px 16px;flex-wrap:wrap;
+  border-bottom:1px solid var(--border);
+  background:rgba(0,0,0,.3);
+}
+.filter-input{
+  background:rgba(0,221,180,.03);border:1px solid var(--border2);
+  border-radius:6px;padding:7px 12px;color:var(--text);
+  font-family:var(--font-mono);font-size:10px;outline:none;
+  transition:all .2s;flex:1;min-width:150px;
+}
+.filter-input:focus{border-color:var(--cyan);background:rgba(0,221,180,.06)}
+.filter-select{
+  background:rgba(0,221,180,.03);border:1px solid var(--border2);
+  border-radius:6px;padding:7px 12px;color:var(--text);
+  font-family:var(--font-mono);font-size:10px;outline:none;
+  cursor:pointer;
+}
+.filter-select:focus{border-color:var(--cyan)}
+.btn-small{
+  padding:5px 10px;font-size:9px;min-height:auto;height:auto;
+}
+
+.pagi{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-top:1px solid var(--border);background:rgba(0,221,180,.01)}
+.pagi-info{font-family:var(--font-mono);font-size:10px;color:var(--muted)}
+.pagi-btns{display:flex;gap:7px}
+.pagi-btn{
+  padding:6px 12px;background:rgba(0,221,180,.03);border:1px solid var(--border2);
+  border-radius:6px;color:var(--text2);font-family:var(--font-mono);
+  font-size:10px;cursor:pointer;transition:all .15s;
+}
+.pagi-btn:hover:not(:disabled){border-color:var(--border3);color:var(--cyan);background:rgba(0,221,180,.07)}
+.pagi-btn:disabled{opacity:.28;cursor:not-allowed}
+
+.empty{text-align:center;padding:36px 12px;color:var(--muted)}
+.empty-icon{font-size:28px;margin-bottom:10px;opacity:.25}
+.empty-text{font-family:var(--font-mono);font-size:10px;letter-spacing:1.5px}
+
+.tab-container{display:flex;gap:2px;border-bottom:1px solid var(--border2);background:rgba(0,0,0,.3)}
+.tab{
+  padding:12px 20px;font-family:var(--font-mono);font-size:10px;
+  color:var(--muted);cursor:pointer;text-transform:uppercase;letter-spacing:2px;
+  border-bottom:2px solid transparent;transition:all .2s;
+}
+.tab:hover{color:var(--text2)}
+.tab.active{color:var(--cyan2);border-bottom-color:var(--cyan2);background:rgba(0,221,180,.03)}
+
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+@media(max-width:768px){
+  .filters{flex-direction:column;align-items:stretch}
+  .filter-input{min-width:100%}
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <nav>
+    <div class="nav-brand">
+      <div class="nav-logo-hex">
+        <svg viewBox="0 0 38 38" fill="none">
+          <polygon points="19,2 35,11 35,27 19,36 3,27 3,11" fill="url(#hexGrad)" stroke="rgba(0,221,180,.5)" stroke-width="1"/>
+          <defs>
+            <linearGradient id="hexGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#00ffcc"/>
+              <stop offset="100%" stop-color="#00aaff"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        <span class="nav-logo-letter">G</span>
+      </div>
+      <div>
+        <div class="nav-title">GOOGLE HISTORY</div>
+        <div class="nav-sub">PERMANENT RECORDS FROM SHEETS</div>
+      </div>
+    </div>
+    <div class="nav-right">
+      <button class="btn btn-small" onclick="refreshData()">🔄 REFRESH</button>
+      <button class="btn btn-small" onclick="exportCsv()">📥 EXPORT CSV</button>
+      <button class="btn btn-primary btn-small" onclick="window.location.href='/'">🏠 HOME</button>
+    </div>
+  </nav>
+
+  <main>
+    <div class="card">
+      <div class="tab-container">
+        <div class="tab active" id="tabTrades" onclick="switchTab('trades')">📊 TRADES</div>
+        <div class="tab" id="tabSignals" onclick="switchTab('signals')">⚡ SIGNALS</div>
+      </div>
+
+      <div class="filters">
+        <input class="filter-input" id="searchInput" placeholder="Search..." oninput="onSearch(this.value)">
+        <select class="filter-select" id="sortBy" onchange="updateSort()">
+          <option value="created_at">Date</option>
+          <option value="pnl">P&L</option>
+          <option value="symbol">Symbol</option>
+        </select>
+        <select class="filter-select" id="sortOrder" onchange="updateSort()">
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
+        <button class="btn btn-small" onclick="refreshData()">🔄</button>
+      </div>
+
+      <div class="table-scroll" id="tableContainer">
+        <table>
+          <thead id="tableHead"></thead>
+          <tbody id="tableBody">
+            <tr><td colspan="20"><div class="empty"><div class="empty-icon">◈</div><div class="empty-text">Loading data...</div></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagi">
+        <div class="pagi-info" id="pagiInfo">0 records</div>
+        <div class="pagi-btns">
+          <button class="pagi-btn" id="prevBtn" onclick="changePage(-1)" disabled>← Prev</button>
+          <span class="pagi-info" id="pageInfo">1</span>
+          <button class="pagi-btn" id="nextBtn" onclick="changePage(1)" disabled>Next →</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+let currentTab = 'trades';
+let currentData = [];
+let page = 1;
+const pageSize = 50;
+let searchQuery = '';
+let sortBy = 'created_at';
+let sortOrder = 'desc';
+
+function switchTab(tab){
+  currentTab = tab;
+  page = 1;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+  loadData();
+}
+
+function onSearch(q){
+  searchQuery = q;
+  page = 1;
+  loadData();
+}
+
+function updateSort(){
+  sortBy = document.getElementById('sortBy').value;
+  sortOrder = document.getElementById('sortOrder').value;
+  page = 1;
+  loadData();
+}
+
+function refreshData(){
+  loadData();
+}
+
+async function loadData(){
+  const tableHead = document.getElementById('tableHead');
+  const tableBody = document.getElementById('tableBody');
+  tableBody.innerHTML = '<tr><td colspan="20"><div class="empty"><div class="empty-icon">◈</div><div class="empty-text">Loading data...</div></div></td></tr>';
+  
+  try{
+    const endpoint = currentTab === 'trades' ? '/api/google-trades' : '/api/google-signals';
+    const params = new URLSearchParams({
+      limit: 1000,
+      offset: 0,
+      search: searchQuery,
+      sortBy: sortBy,
+      sortOrder: sortOrder
+    });
+    
+    const res = await fetch(`${endpoint}?${params.toString()}`);
+    const json = await res.json();
+    
+    if(json.success){
+      currentData = currentTab === 'trades' ? json.trades : json.signals;
+      renderTable();
+    }else{
+      throw new Error(json.message || 'Failed to load data');
+    }
+  }catch(err){
+    console.error(err);
+    tableBody.innerHTML = `<tr><td colspan="20"><div class="empty"><div class="empty-icon">⚠️</div><div class="empty-text">Error loading data: ${err.message}</div></div></td></tr>`;
+  }
+}
+
+function getTradeHeaders(){
+  return [
+    'ID','Symbol','Side','Entry Price','Exit Price','Quantity','P&L','Entry Time','Exit Time','Is Latest','Entry Order','Exit Order','Decisions','Created At'
+  ];
+}
+
+function getSignalHeaders(){
+  return [
+    'ID','Order ID','Symbol','Position','Lot','1M','5M','15M','30M','1H','2H','4H','1D','1W','Final','Entry Time','Created At'
+  ];
+}
+
+function renderTable(){
+  const tableHead = document.getElementById('tableHead');
+  const tableBody = document.getElementById('tableBody');
+  const headers = currentTab === 'trades' ? getTradeHeaders() : getSignalHeaders();
+  
+  tableHead.innerHTML = `<tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>`;
+  
+  const start = (page -1)*pageSize;
+  const end = start + pageSize;
+  const pageData = currentData.slice(start, end);
+  
+  if(pageData.length === 0){
+    tableBody.innerHTML = '<tr><td colspan="20"><div class="empty"><div class="empty-icon">◈</div><div class="empty-text">No data found</div></div></td></tr>';
+  }else{
+    tableBody.innerHTML = pageData.map(row => {
+      if(currentTab === 'trades'){
+        const isProfit = parseFloat(row.pnl) > 0;
+        return `<tr class="${isProfit ? 'trade-row-profit' : 'trade-row-loss'}">
+          <td>${row.id}</td>
+          <td>${row.symbol}</td>
+          <td class="${row.side === 'buy' ? 'side-buy' : 'side-sell'}">${row.side.toUpperCase()}</td>
+          <td>${row.entry_price}</td>
+          <td>${row.exit_price}</td>
+          <td>${row.quantity}</td>
+          <td class="${isProfit ? 'pnl-p' : 'pnl-n'}">${row.pnl}</td>
+          <td>${row.entry_time}</td>
+          <td>${row.exit_time}</td>
+          <td>${row.is_latest}</td>
+          <td>${row.entry_order_id}</td>
+          <td>${row.exit_order_id}</td>
+          <td>${row.trade_decisions}</td>
+          <td>${row.created_at}</td>
+        </tr>`;
+      }else{
+        return `<tr>
+          <td>${row.id}</td>
+          <td>${row.order_id}</td>
+          <td>${row.symbol}</td>
+          <td>${row.position}</td>
+          <td>${row.lot_size}</td>
+          <td>${row.tf_1m}</td>
+          <td>${row.tf_5m}</td>
+          <td>${row.tf_15m}</td>
+          <td>${row.tf_30m}</td>
+          <td>${row.tf_1h}</td>
+          <td>${row.tf_2h}</td>
+          <td>${row.tf_4h}</td>
+          <td>${row.tf_1d}</td>
+          <td>${row.tf_1w}</td>
+          <td>${row.final_decision}</td>
+          <td>${row.entry_time}</td>
+          <td>${row.created_at}</td>
+        </tr>`;
+      }
+    }).join('');
+  }
+  
+  document.getElementById('pagiInfo').textContent = `${currentData.length} records`;
+  const totalPages = Math.ceil(currentData.length / pageSize);
+  document.getElementById('pageInfo').textContent = `${page} / ${totalPages || 1}`;
+  document.getElementById('prevBtn').disabled = page <=1;
+  document.getElementById('nextBtn').disabled = page >= totalPages;
+}
+
+function changePage(delta){
+  const totalPages = Math.ceil(currentData.length / pageSize);
+  page = Math.max(1, Math.min(page + delta, totalPages));
+  renderTable();
+}
+
+function exportCsv(){
+  if(!currentData.length){
+    alert('No data to export');
+    return;
+  }
+  
+  const headers = currentTab === 'trades' ? getTradeHeaders() : getSignalHeaders();
+  const csvRows = [headers.join(',')];
+  
+  currentData.forEach(row => {
+    let values;
+    if(currentTab === 'trades'){
+      values = [
+        row.id, row.symbol, row.side, row.entry_price, row.exit_price, row.quantity, row.pnl,
+        row.entry_time, row.exit_time, row.is_latest, row.entry_order_id, row.exit_order_id,
+        (row.trade_decisions || '').replace(/"/g,'""'), row.created_at
+      ];
+    }else{
+      values = [
+        row.id, row.order_id, row.symbol, row.position, row.lot_size, row.tf_1m, row.tf_5m,
+        row.tf_15m, row.tf_30m, row.tf_1h, row.tf_2h, row.tf_4h, row.tf_1d, row.tf_1w,
+        row.final_decision, row.entry_time, row.created_at
+      ];
+    }
+    csvRows.push(values.map(v => `"${String(v || '').replace(/"/g,'""')}"`).join(','));
+  });
+  
+  const csvContent = csvRows.join('\n');
+  const blob = new Blob([csvContent], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${currentTab}_history_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Initial load
+loadData();
+</script>
+</body>
+</html>

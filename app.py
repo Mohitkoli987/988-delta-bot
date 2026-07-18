@@ -25,8 +25,10 @@ import websocket
 class Logger(object):
     def __init__(self, filename="server.log", secondary_file="trade.log"):
         self.terminal = sys.stdout
-        self.log = open(filename, "w", encoding="utf-8", buffering=1)
-        self.trade_log_file = open(secondary_file, "w", encoding="utf-8", buffering=1)
+        self.log = open(filename, "a", encoding="utf-8", buffering=1)  # Changed from w to a to append
+        self.trade_log_file = open(secondary_file, "a", encoding="utf-8", buffering=1)  # Changed from w to a to append
+        self.filename = filename
+        self.secondary_file = secondary_file
 
     def write(self, message):
         self.terminal.write(message)
@@ -36,6 +38,14 @@ class Logger(object):
             os.fsync(self.log.fileno())
         except:
             pass
+        
+        # Append to Google Drive in background
+        def append_background():
+            try:
+                google_integration.append_log_to_drive(self.filename, message)
+            except Exception as e:
+                pass  # Don't log here to avoid infinite loops
+        threading.Thread(target=append_background, daemon=True).start()
 
     def trade_write(self, category, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -49,6 +59,14 @@ class Logger(object):
             os.fsync(self.trade_log_file.fileno())
         except:
             pass
+        
+        # Append trade log to Google Drive in background
+        def append_background():
+            try:
+                google_integration.append_log_to_drive(self.secondary_file, formatted_msg)
+            except Exception as e:
+                pass  # Don't log here to avoid infinite loops
+        threading.Thread(target=append_background, daemon=True).start()
 
     def flush(self):
         self.terminal.flush()
@@ -89,6 +107,7 @@ log.setLevel(logging.ERROR)
 load_dotenv()
 
 from keepalive import start_keep_alive
+import google_integration
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -138,11 +157,11 @@ MYSQL_POOL = PooledDB(
     maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
     setsession=[],
     ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
-    host=os.getenv('MYSQL_HOST', 'brisr7ouykimlchu1jw4-mysql.services.clever-cloud.com'),
+    host=os.getenv('MYSQL_HOST', 'bz4nf1aycs9arstd4y4l-mysql.services.clever-cloud.com'),
     port=int(os.getenv('MYSQL_PORT', 3306)),
-    user=os.getenv('MYSQL_USER', 'uduyvfzfdqgwzhvs'),
-    password=os.getenv('MYSQL_PASSWORD', 'lmwz3Vs0MpKEfLzQUrGV'),
-    database=os.getenv('MYSQL_DB', 'brisr7ouykimlchu1jw4'),
+    user=os.getenv('MYSQL_USER', 'uhfemavaz7iyjcnh'),
+    password=os.getenv('MYSQL_PASSWORD', 'jVj84ZmtLAPJ50xJnMUJ'),
+    database=os.getenv('MYSQL_DB', 'bz4nf1aycs9arstd4y4l'),
     charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor,
     autocommit=False,
@@ -740,7 +759,7 @@ def save_signal_score_history(order_id, symbol, position, lot_size,
              tf_1h, tf_2h, tf_4h, tf_1d, tf_1w, final_decision, entry_time)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         '''
-        execute_mysql_query(
+        inserted_id = execute_mysql_query(
             insert_query,
             (
                 str(order_id), symbol, position, lot_size,
@@ -757,6 +776,24 @@ def save_signal_score_history(order_id, symbol, position, lot_size,
             ),
             commit=True
         )
+        
+        # Get the full saved signal data for Google Sheets
+        saved_signal = execute_mysql_query(
+            "SELECT * FROM signal_scores_history WHERE id = %s",
+            (inserted_id,),
+            fetch_one=True
+        )
+        
+        # Append to Google Sheets in background thread (non-blocking)
+        if saved_signal:
+            def append_signal_background():
+                try:
+                    google_integration.append_signal_to_sheet(saved_signal)
+                    log_system(f"[SIGNAL SCORES] Saved snapshot to Google Sheets for order {order_id}")
+                except Exception as e:
+                    log_error(f"[SIGNAL SCORES] Error saving snapshot to Google Sheets for order {order_id}: {e}")
+            threading.Thread(target=append_signal_background, daemon=True).start()
+            
         log_system(f"[SIGNAL SCORES] Saved snapshot for order {order_id}")
     except Exception as e:
         log_error(f"[SIGNAL SCORES] Error saving snapshot for order {order_id}: {e}")
@@ -1562,11 +1599,14 @@ def generate_smart_signal(reason="trade_decision"):
         print(f"   4H  → {b4h:7s} | BUY={r4h['score_buy']:2d} SELL={r4h['score_sell']:2d} Net={r4h['net']:+3d}  ← MASTER")
     print(f"   1H  → {b1h:7s} | BUY={r1h['score_buy']:2d} SELL={r1h['score_sell']:2d} Net={r1h['net']:+3d}  (confidence only)")
     print(f"   15M → {b15m:7s} | BUY={r15m['score_buy']:2d} SELL={r15m['score_sell']:2d} Net={r15m['net']:+3d}  ← ENTRY")
+    
 
     # >>> ADDED: single call, info-only — prints extra timeframe scores (1m,5m,30m,2h,1d,1w)
     # AND captures them so we can save a full score snapshot to DB later.
     # Does not change any variable used below in the decision logic.
     extra_scores = _print_extra_timeframe_scores(symbol)
+    b30m = extra_scores.get('30M', {}).get('bias', 'NEUTRAL')
+    b2h  = extra_scores.get('2H',  {}).get('bias', 'NEUTRAL')
 
     # >>> ADDED: build formatted timeframe_scores dict — INFO ONLY, purely for
     # saving/display. Not used anywhere in the decision logic below.
@@ -1595,8 +1635,16 @@ def generate_smart_signal(reason="trade_decision"):
             print(f"⏳ 15M net={r15m['net']} too weak (need >={MIN_15M_NET})")
             return _make_wait_signal(reason, f"15M weak: net={r15m['net']} need >={MIN_15M_NET}", timeframe_scores=timeframe_scores)
 
+        if b30m != master or b1h != master or b2h != master:
+            print(f"⏳ Confluence fail — 30M={b30m} 1H={b1h} 2H={b2h} vs master {master}")
+            return _make_wait_signal(
+                reason,
+                f"Waiting for 30M/1H/2H alignment with 4H {master} (30M={b30m},1H={b1h},2H={b2h})",
+                timeframe_scores=timeframe_scores
+            )
+
         direction = master
-        print(f"\n✅ 4H {master} + 15M {b15m} aligned — SIGNAL: {direction}")
+        print(f"\n✅ 4H {master} + 15M {b15m} + 30M/1H/2H aligned — SIGNAL: {direction}")
 
     else:
         print(f"⚖️ 4H NEUTRAL — checking 1H+15M")
@@ -1769,7 +1817,7 @@ def save_closed_position(trade_data):
                  entry_time, exit_time, is_latest, entry_order_id, exit_order_id, trade_decisions)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s)
             '''
-            execute_mysql_query(
+            inserted_id = execute_mysql_query(
                 insert_query,
                 (
                     trade_data['symbol'],
@@ -1786,6 +1834,23 @@ def save_closed_position(trade_data):
                 ),
                 commit=True
             )
+
+            # Get the full saved trade data for Google Sheets
+            saved_trade = execute_mysql_query(
+                "SELECT * FROM closed_positions WHERE id = %s",
+                (inserted_id,),
+                fetch_one=True
+            )
+
+            # Append to Google Sheets in background thread (non-blocking)
+            if saved_trade:
+                def append_trade_background():
+                    try:
+                        google_integration.append_trade_to_sheet(saved_trade)
+                        log_system(f"TRADE SAVED TO GOOGLE SHEETS | id={inserted_id}")
+                    except Exception as e:
+                        log_error(f"Error saving trade to Google Sheets: {e}")
+                threading.Thread(target=append_trade_background, daemon=True).start()
 
             if entry_order_id and str(entry_order_id) in ACTIVE_TRADE_DECISIONS:
                 del ACTIVE_TRADE_DECISIONS[str(entry_order_id)]
@@ -4232,6 +4297,50 @@ def clear_all_signal_scores():
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
+# ========== GOOGLE HISTORY UI ==========
+@app.route('/google-history')
+def google_history():
+    return render_template('google_history.html')
+
+
+@app.route('/api/google-trades', methods=['GET'])
+def get_google_trades():
+    try:
+        limit = int(request.args.get('limit', 100))
+        offset = int(request.args.get('offset', 0))
+        search = request.args.get('search', None)
+        sort_by = request.args.get('sort_by', 'created_at')
+        sort_order = request.args.get('sort_order', 'desc')
+        
+        trades = google_integration.get_trades_from_sheet(
+            limit=limit, offset=offset, search=search, 
+            sort_by=sort_by, sort_order=sort_order
+        )
+        
+        return jsonify({'success': True, 'trades': trades})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}', 'trades': []})
+
+
+@app.route('/api/google-signals', methods=['GET'])
+def get_google_signals():
+    try:
+        limit = int(request.args.get('limit', 100))
+        offset = int(request.args.get('offset', 0))
+        search = request.args.get('search', None)
+        sort_by = request.args.get('sort_by', 'created_at')
+        sort_order = request.args.get('sort_order', 'desc')
+        
+        signals = google_integration.get_signals_from_sheet(
+            limit=limit, offset=offset, search=search, 
+            sort_by=sort_by, sort_order=sort_order
+        )
+        
+        return jsonify({'success': True, 'signals': signals})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}', 'signals': []})
+
+
 
 
 # _break_even_applied_lock ADD karo
@@ -4721,6 +4830,7 @@ if __name__ == '__main__':
         print(f"⚠️ Auto-resume check failed: {e}")
 
     try:
+        print("👉 http://127.0.0.1:8090")
         app.run(debug=True, host='0.0.0.0', port=8090, use_reloader=False)
     finally:
         print("Stopping signal bot...")
