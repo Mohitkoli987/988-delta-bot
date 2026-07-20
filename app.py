@@ -22,8 +22,128 @@ from datetime import datetime
 import websocket
 
 # ========== LOGGING CONFIGURATION ==========
+LOG_MAX_BYTES = 20_000_000  # 20MB cap per log file
+_LOG_ROTATE_LAST = 0.0
+_LOG_ROTATE_LOCK = Lock()
+_LOG_ROTATE_INTERVAL = 300  # check at most every 5 min
+
+
+def _rotate_log_if_needed(filepath, max_bytes=LOG_MAX_BYTES):
+    """Trim oversized log files — keeps last half. Does not touch trading logic."""
+    try:
+        if not os.path.exists(filepath):
+            return
+        if os.path.getsize(filepath) <= max_bytes:
+            return
+        with open(filepath, "rb") as f:
+            f.seek(-(max_bytes // 2), os.SEEK_END)
+            data = f.read()
+        with open(filepath, "wb") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+
+def _maybe_rotate_logs():
+    """Throttled rotation check — avoids doing this on every log line."""
+    global _LOG_ROTATE_LAST
+    now = _time.time()
+    with _LOG_ROTATE_LOCK:
+        if now - _LOG_ROTATE_LAST < _LOG_ROTATE_INTERVAL:
+            return
+        _LOG_ROTATE_LAST = now
+    _rotate_log_if_needed("server.log")
+    _rotate_log_if_needed("trade.log")
+
+
+def _tail_read_lines(filepath, limit=100, chunk_size=200_000):
+    """Read last N lines without loading the entire file into memory."""
+    if not os.path.exists(filepath):
+        return [], 0
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        return [], 0
+    with open(filepath, "rb") as f:
+        seek_pos = max(0, file_size - chunk_size)
+        f.seek(seek_pos)
+        data = f.read().decode("utf-8", errors="ignore")
+    lines = data.splitlines()
+    if seek_pos > 0 and lines:
+        lines = lines[1:]
+    return lines[-limit:], len(lines)
+
+
+def _get_process_rss_mb():
+    """Current process RSS in MB (Render/Linux)."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _file_size_mb(path):
+    try:
+        if os.path.exists(path):
+            return round(os.path.getsize(path) / (1024 * 1024), 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_mysql_storage_stats():
+    """Clever Cloud MySQL usage from information_schema (read-only)."""
+    try:
+        summary = execute_mysql_query(
+            """
+            SELECT
+                ROUND(COALESCE(SUM(data_length + index_length), 0) / 1024 / 1024, 2) AS used_mb,
+                COUNT(*) AS table_count
+            FROM information_schema.TABLES
+            WHERE table_schema = DATABASE()
+            """,
+            fetch_one=True,
+        )
+        tables = execute_mysql_query(
+            """
+            SELECT
+                table_name,
+                ROUND((data_length + index_length) / 1024 / 1024, 2) AS size_mb,
+                table_rows
+            FROM information_schema.TABLES
+            WHERE table_schema = DATABASE()
+            ORDER BY (data_length + index_length) DESC
+            """,
+            fetch_all=True,
+        ) or []
+        return {
+            "used_mb": float(summary["used_mb"] or 0) if summary else 0.0,
+            "table_count": int(summary["table_count"] or 0) if summary else 0,
+            "tables": [
+                {
+                    "name": t["table_name"],
+                    "size_mb": float(t["size_mb"] or 0),
+                    "rows": int(t["table_rows"] or 0),
+                }
+                for t in tables
+            ],
+        }
+    except Exception as e:
+        return {"used_mb": None, "table_count": 0, "tables": [], "error": str(e)}
+
+
 class Logger(object):
     def __init__(self, filename="server.log", secondary_file="trade.log"):
+        _rotate_log_if_needed(filename)
+        _rotate_log_if_needed(secondary_file)
         self.terminal = sys.stdout
         self.log = open(filename, "a", encoding="utf-8", buffering=1)  # Changed from w to a to append
         self.trade_log_file = open(secondary_file, "a", encoding="utf-8", buffering=1)  # Changed from w to a to append
@@ -38,14 +158,6 @@ class Logger(object):
             os.fsync(self.log.fileno())
         except:
             pass
-        
-        # Append to Google Drive in background
-        def append_background():
-            try:
-                google_integration.append_log_to_drive(self.filename, message)
-            except Exception as e:
-                pass  # Don't log here to avoid infinite loops
-        threading.Thread(target=append_background, daemon=True).start()
 
     def trade_write(self, category, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -59,14 +171,7 @@ class Logger(object):
             os.fsync(self.trade_log_file.fileno())
         except:
             pass
-        
-        # Append trade log to Google Drive in background
-        def append_background():
-            try:
-                google_integration.append_log_to_drive(self.secondary_file, formatted_msg)
-            except Exception as e:
-                pass  # Don't log here to avoid infinite loops
-        threading.Thread(target=append_background, daemon=True).start()
+        _maybe_rotate_logs()
 
     def flush(self):
         self.terminal.flush()
@@ -107,7 +212,6 @@ log.setLevel(logging.ERROR)
 load_dotenv()
 
 from keepalive import start_keep_alive
-import google_integration
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -259,23 +363,124 @@ last_processed = {}
 
 # =====================================================================
 # Step-Based Lot Progression System
+# Martingale: step n = start_lot * 2^(n-1)
+# start_lot + streak (N steps) UI/DB se aate hain — reset/wrap logic same rahegi.
 # =====================================================================
-LOT_STEPS = {
-    1: 1,
-    2: 2,
-    3: 4,
-    4: 8,
-    # 5: 16,
-    # 6: 32,
+LOT_STEPS_DEFAULT_START = 1
+LOT_STEPS_DEFAULT_STREAK = 4  # matches previous hardcoded 1,2,4,8
+
+
+def build_lot_steps(start_lot, streak):
+    """Build {1: S, 2: S*2, 3: S*4, ... N: S*2^(N-1)}"""
+    start = float(start_lot)
+    n_steps = int(streak)
+    steps = {}
+    for n in range(1, n_steps + 1):
+        val = start * (2 ** (n - 1))
+        steps[n] = int(val) if float(val).is_integer() else val
+    return steps
+
+
+LOT_STEPS = build_lot_steps(LOT_STEPS_DEFAULT_START, LOT_STEPS_DEFAULT_STREAK)
+_lot_steps_lock = Lock()
+LOT_STEPS_META = {
+    'start_lot': float(LOT_STEPS_DEFAULT_START),
+    'streak': int(LOT_STEPS_DEFAULT_STREAK),
 }
+
+
+def get_lot_steps_config():
+    with _lot_steps_lock:
+        return {
+            'start_lot': LOT_STEPS_META['start_lot'],
+            'streak': LOT_STEPS_META['streak'],
+            'lot_steps': dict(LOT_STEPS),
+            'max_steps': max(LOT_STEPS.keys()) if LOT_STEPS else 1,
+        }
+
+
+def apply_lot_steps_config(start_lot, streak):
+    """Rebuild LOT_STEPS + update BOT_STATE max/base. Does NOT touch progression/reset logic."""
+    global LOT_STEPS
+    start = float(start_lot)
+    n = int(streak)
+    if start <= 0:
+        return False, 'Start lot must be > 0'
+    if n < 1 or n > 20:
+        return False, 'Streak (steps) must be between 1 and 20'
+
+    new_steps = build_lot_steps(start, n)
+    with _lot_steps_lock:
+        LOT_STEPS.clear()
+        LOT_STEPS.update(new_steps)
+        LOT_STEPS_META['start_lot'] = start if not float(start).is_integer() else int(start)
+        LOT_STEPS_META['streak'] = n
+
+    BOT_STATE['max_steps'] = n
+    BOT_STATE['base_lot'] = LOT_STEPS[1]
+    # If idle at step 1 with stale lot, sync to new start lot
+    if not BOT_STATE.get('running') and BOT_STATE.get('current_step', 1) == 1:
+        BOT_STATE['current_lot'] = LOT_STEPS[1]
+
+    return True, get_lot_steps_config()
+
+
+def save_lot_steps_config_to_db(cfg=None):
+    try:
+        data = cfg if cfg is not None else get_lot_steps_config()
+        payload = {
+            'start_lot': data['start_lot'],
+            'streak': data['streak'],
+            'saved_at': datetime.now().isoformat(),
+        }
+        upsert_query = '''
+            INSERT INTO bot_state (state_key, state_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
+        '''
+        execute_mysql_query(upsert_query, ('lot_steps_config', json.dumps(payload)), commit=True)
+        log_system(
+            f"LOT STEPS SAVED | start={payload['start_lot']} streak={payload['streak']} "
+            f"seq={get_lot_steps_config()['lot_steps']}"
+        )
+        return True
+    except Exception as e:
+        log_error(f"Saving lot steps config: {e}")
+        return False
+
+
+def load_lot_steps_config_from_db():
+    try:
+        result = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('lot_steps_config',),
+            fetch_one=True
+        )
+        if not result or not result.get('state_value'):
+            log_system("No saved lot steps config — using defaults, writing to DB")
+            apply_lot_steps_config(LOT_STEPS_DEFAULT_START, LOT_STEPS_DEFAULT_STREAK)
+            save_lot_steps_config_to_db()
+            return False
+
+        saved = json.loads(result['state_value'])
+        start = float(saved.get('start_lot', LOT_STEPS_DEFAULT_START))
+        streak = int(saved.get('streak', LOT_STEPS_DEFAULT_STREAK))
+        ok, _ = apply_lot_steps_config(start, streak)
+        if ok:
+            log_system(f"LOT STEPS LOADED | start={start} streak={streak} seq={LOT_STEPS}")
+        return ok
+    except Exception as e:
+        log_error(f"Loading lot steps config: {e}")
+        return False
+
 
 # Bot State
 BOT_STATE = {
     'running': False,
     'thread': None,
     'current_step': 1,
-    'current_lot': 1,
-    'base_lot': 1,
+    'current_lot': LOT_STEPS[1],
+    'base_lot': LOT_STEPS[1],
     'leverage': 50,
     'tp_percent': 4,
     'sl_percent': 2,
@@ -290,6 +495,109 @@ BOT_STATE = {
     'last_placed_order_id': None,
     'order_completed': True,
 }
+
+# Bot UI config (symbol, leverage, TP/SL) — persists in MySQL, survives refresh/restart
+BOT_CONFIG_DEFAULTS = {
+    'symbol': 'ETHUSD',
+    'leverage': 100,
+    'tp_percent': 2.0,
+    'sl_percent': 1.0,
+}
+
+
+def get_bot_config():
+    return {
+        'symbol': BOT_STATE['symbol'],
+        'leverage': BOT_STATE['leverage'],
+        'tp_percent': float(BOT_STATE['tp_percent']),
+        'sl_percent': float(BOT_STATE['sl_percent']),
+    }
+
+
+def save_bot_config_to_db(cfg=None):
+    try:
+        data = cfg if cfg is not None else get_bot_config()
+        payload = {
+            'symbol': str(data['symbol']).upper(),
+            'leverage': int(data['leverage']),
+            'tp_percent': float(data['tp_percent']),
+            'sl_percent': float(data['sl_percent']),
+            'saved_at': datetime.now().isoformat(),
+        }
+        upsert_query = '''
+            INSERT INTO bot_state (state_key, state_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
+        '''
+        execute_mysql_query(upsert_query, ('bot_config', json.dumps(payload)), commit=True)
+        log_system(
+            f"BOT CONFIG SAVED | {payload['symbol']} lev={payload['leverage']}x "
+            f"TP={payload['tp_percent']}% SL={payload['sl_percent']}%"
+        )
+        return True
+    except Exception as e:
+        log_error(f"Saving bot config: {e}")
+        return False
+
+
+def load_bot_config_from_db():
+    try:
+        result = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('bot_config',),
+            fetch_one=True
+        )
+        if not result or not result.get('state_value'):
+            log_system("No saved bot config — using defaults, writing to DB")
+            BOT_STATE['symbol'] = BOT_CONFIG_DEFAULTS['symbol']
+            BOT_STATE['leverage'] = BOT_CONFIG_DEFAULTS['leverage']
+            BOT_STATE['tp_percent'] = BOT_CONFIG_DEFAULTS['tp_percent']
+            BOT_STATE['sl_percent'] = BOT_CONFIG_DEFAULTS['sl_percent']
+            save_bot_config_to_db(BOT_CONFIG_DEFAULTS)
+            return False
+
+        saved = json.loads(result['state_value'])
+        BOT_STATE['symbol'] = str(saved.get('symbol', BOT_CONFIG_DEFAULTS['symbol'])).upper()
+        BOT_STATE['leverage'] = int(saved.get('leverage', BOT_CONFIG_DEFAULTS['leverage']))
+        BOT_STATE['tp_percent'] = float(saved.get('tp_percent', BOT_CONFIG_DEFAULTS['tp_percent']))
+        BOT_STATE['sl_percent'] = float(saved.get('sl_percent', BOT_CONFIG_DEFAULTS['sl_percent']))
+        log_system(
+            f"BOT CONFIG LOADED | {BOT_STATE['symbol']} lev={BOT_STATE['leverage']}x "
+            f"TP={BOT_STATE['tp_percent']}% SL={BOT_STATE['sl_percent']}%"
+        )
+        return True
+    except Exception as e:
+        log_error(f"Loading bot config: {e}")
+        return False
+
+
+def apply_bot_config(data: dict):
+    """Validate + apply bot UI config into memory and DB. Does not start/stop bot."""
+    try:
+        symbol = str(data.get('symbol', BOT_STATE['symbol'])).upper()
+        leverage = int(data.get('leverage', BOT_STATE['leverage']))
+        tp_percent = float(data.get('tp_percent', BOT_STATE['tp_percent']))
+        sl_percent = float(data.get('sl_percent', BOT_STATE['sl_percent']))
+
+        valid_symbols = ['ETHUSD']
+        if symbol not in valid_symbols:
+            return False, f'Invalid symbol. Valid: {valid_symbols}'
+        if leverage < 1 or leverage > 200:
+            return False, 'Leverage must be integer between 1-200'
+        if not (0.1 <= tp_percent <= 50):
+            return False, 'TP percent must be between 0.1-50'
+        if not (0.1 <= sl_percent <= 50):
+            return False, 'SL percent must be between 0.1-50'
+
+        BOT_STATE['symbol'] = symbol
+        BOT_STATE['leverage'] = leverage
+        BOT_STATE['tp_percent'] = tp_percent
+        BOT_STATE['sl_percent'] = sl_percent
+        save_bot_config_to_db(get_bot_config())
+        return True, get_bot_config()
+    except (TypeError, ValueError) as e:
+        return False, f'Invalid values: {e}'
+
 
 LOT_SIZES = {
     'ETHUSD': 0.01,
@@ -776,24 +1084,7 @@ def save_signal_score_history(order_id, symbol, position, lot_size,
             ),
             commit=True
         )
-        
-        # Get the full saved signal data for Google Sheets
-        saved_signal = execute_mysql_query(
-            "SELECT * FROM signal_scores_history WHERE id = %s",
-            (inserted_id,),
-            fetch_one=True
-        )
-        
-        # Append to Google Sheets in background thread (non-blocking)
-        if saved_signal:
-            def append_signal_background():
-                try:
-                    google_integration.append_signal_to_sheet(saved_signal)
-                    log_system(f"[SIGNAL SCORES] Saved snapshot to Google Sheets for order {order_id}")
-                except Exception as e:
-                    log_error(f"[SIGNAL SCORES] Error saving snapshot to Google Sheets for order {order_id}: {e}")
-            threading.Thread(target=append_signal_background, daemon=True).start()
-            
+
         log_system(f"[SIGNAL SCORES] Saved snapshot for order {order_id}")
     except Exception as e:
         log_error(f"[SIGNAL SCORES] Error saving snapshot for order {order_id}: {e}")
@@ -895,13 +1186,14 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
         return result
  
     # ── HELPER: derive next step purely from lot_size (no BOT_STATE dependency) ──
-    def get_next_step_from_lot(lot_size, pnl):
+    def get_next_step_from_lot(lot_size, pnl, be_retry=False):
         """
         Given the actual lot_size used in the last trade and its PnL,
         return the correct (next_step, next_lot) independently.
- 
+
         Steps:
           - Find which step corresponds to lot_size
+          - If BE SL retry → same step/lot (no win/loss progression)
           - If WIN  → next_step = 1
           - If LOSS → next_step = last_step + 1 (wraps to 1 at max)
         """
@@ -923,7 +1215,16 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
                     closest_step = step
             last_step = closest_step
             log_system(f"[PRE-ORDER VERIFY] No exact lot match for {lot_size} — closest step={last_step}")
- 
+
+        if be_retry:
+            next_step = last_step
+            next_lot  = LOT_STEPS[next_step]
+            log_system(
+                f"[PRE-ORDER VERIFY] BE SL retry (lot={lot_size} step={last_step}) "
+                f"→ Same Step={next_step} Lot={next_lot}"
+            )
+            return next_step, next_lot
+
         if pnl > 0:
             # WIN → reset to Step 1
             next_step = 1
@@ -1077,7 +1378,8 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
                 # ── KEY FIX: Derive next step from ACTUAL lot_size in fills ──
                 # NEVER use BOT_STATE['current_step'] here — it may already be
                 # incremented by _apply_step_progression() causing double-increment
-                next_step, next_lot = get_next_step_from_lot(lot_size, pnl)
+                be_retry = _pop_be_retry_pending(symbol)
+                next_step, next_lot = get_next_step_from_lot(lot_size, pnl, be_retry=be_retry)
  
                 # Correct BOT_STATE in memory
                 old_step = BOT_STATE['current_step']
@@ -1095,7 +1397,8 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
             else:
                 # ── Pair already cached ───────────────────────────────
                 # Still re-derive from lot_size independently — don't trust BOT_STATE
-                next_step, next_lot = get_next_step_from_lot(lot_size, pnl)
+                be_retry = _pop_be_retry_pending(symbol)
+                next_step, next_lot = get_next_step_from_lot(lot_size, pnl, be_retry=be_retry)
  
                 old_step = BOT_STATE['current_step']
                 old_lot  = BOT_STATE['current_lot']
@@ -1135,7 +1438,8 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
  
         # ── KEY FIX: Derive next step from cached lot_size independently ──
         # Again: NEVER rely on BOT_STATE['current_step'] here
-        next_step, next_lot = get_next_step_from_lot(cached_lot, cached_pnl)
+        be_retry = _pop_be_retry_pending(symbol)
+        next_step, next_lot = get_next_step_from_lot(cached_lot, cached_pnl, be_retry=be_retry)
  
         old_step = BOT_STATE['current_step']
         old_lot  = BOT_STATE['current_lot']
@@ -1605,8 +1909,6 @@ def generate_smart_signal(reason="trade_decision"):
     # AND captures them so we can save a full score snapshot to DB later.
     # Does not change any variable used below in the decision logic.
     extra_scores = _print_extra_timeframe_scores(symbol)
-    b30m = extra_scores.get('30M', {}).get('bias', 'NEUTRAL')
-    b2h  = extra_scores.get('2H',  {}).get('bias', 'NEUTRAL')
 
     # >>> ADDED: build formatted timeframe_scores dict — INFO ONLY, purely for
     # saving/display. Not used anywhere in the decision logic below.
@@ -1622,38 +1924,21 @@ def generate_smart_signal(reason="trade_decision"):
         '1w':  _format_tf_result(extra_scores.get('1W')),
     }
 
-    MIN_15M_NET = 4
-
-    if b4h in ('BUY', 'SELL'):
-        master = b4h
-
-        if b15m != master:
-            print(f"⏳ 15M={b15m} not aligned with 4H={master} — wait for 15M entry")
-            return _make_wait_signal(reason, f"Waiting for 15M to align with 4H {master}", timeframe_scores=timeframe_scores)
-
-        if abs(r15m['net']) < MIN_15M_NET:
-            print(f"⏳ 15M net={r15m['net']} too weak (need >={MIN_15M_NET})")
-            return _make_wait_signal(reason, f"15M weak: net={r15m['net']} need >={MIN_15M_NET}", timeframe_scores=timeframe_scores)
-
-        if b30m != master or b1h != master or b2h != master:
-            print(f"⏳ Confluence fail — 30M={b30m} 1H={b1h} 2H={b2h} vs master {master}")
-            return _make_wait_signal(
-                reason,
-                f"Waiting for 30M/1H/2H alignment with 4H {master} (30M={b30m},1H={b1h},2H={b2h})",
-                timeframe_scores=timeframe_scores
-            )
-
-        direction = master
-        print(f"\n✅ 4H {master} + 15M {b15m} + 30M/1H/2H aligned — SIGNAL: {direction}")
-
-    else:
-        print(f"⚖️ 4H NEUTRAL — checking 1H+15M")
-        if b1h == 'NEUTRAL' or b15m == 'NEUTRAL' or b1h != b15m:
-            return _make_wait_signal(reason, f"4H neutral, 1H={b1h} 15M={b15m} not aligned", timeframe_scores=timeframe_scores)
-        if abs(r1h['net']) < 5 or abs(r15m['net']) < 5:
-            return _make_wait_signal(reason, f"4H neutral, signals too weak 1H={r1h['net']} 15M={r15m['net']}", timeframe_scores=timeframe_scores)
-        direction = b15m
-        print(f"\n✅ 4H neutral but 1H+15M both {direction} — SIGNAL: {direction}")
+    # Final decision uses ONLY user-selected timeframes (Decision Timeframes card).
+    # Scoring / snapshot above stays unchanged. Bot loop / place_order untouched.
+    score_map = {
+        '1m':  extra_scores.get('1M'),
+        '5m':  extra_scores.get('5M'),
+        '15m': r15m,
+        '30m': extra_scores.get('30M'),
+        '1h':  r1h,
+        '2h':  extra_scores.get('2H'),
+        '4h':  r4h,
+        '1d':  extra_scores.get('1D'),
+    }
+    direction, wait_resp = _resolve_signal_from_selected_tfs(score_map, timeframe_scores, reason)
+    if wait_resp is not None:
+        return wait_resp
 
     MAX_SCORE = 75.0
     w_4h = 0.35 if r4h else 0.0
@@ -1834,23 +2119,6 @@ def save_closed_position(trade_data):
                 ),
                 commit=True
             )
-
-            # Get the full saved trade data for Google Sheets
-            saved_trade = execute_mysql_query(
-                "SELECT * FROM closed_positions WHERE id = %s",
-                (inserted_id,),
-                fetch_one=True
-            )
-
-            # Append to Google Sheets in background thread (non-blocking)
-            if saved_trade:
-                def append_trade_background():
-                    try:
-                        google_integration.append_trade_to_sheet(saved_trade)
-                        log_system(f"TRADE SAVED TO GOOGLE SHEETS | id={inserted_id}")
-                    except Exception as e:
-                        log_error(f"Error saving trade to Google Sheets: {e}")
-                threading.Thread(target=append_trade_background, daemon=True).start()
 
             if entry_order_id and str(entry_order_id) in ACTIVE_TRADE_DECISIONS:
                 del ACTIVE_TRADE_DECISIONS[str(entry_order_id)]
@@ -2707,7 +2975,7 @@ def get_entry_exit_from_fills():
     return entry_exit_data
 
 
-def _apply_step_progression(pnl):
+def _apply_step_progression(pnl, be_retry=False):
     global BOT_STATE
 
     current_step = BOT_STATE['current_step']
@@ -2715,6 +2983,13 @@ def _apply_step_progression(pnl):
 
     result_type = 'PROFIT' if pnl > 0 else 'LOSS'
     log_trade(f"POSITION CLOSED | PnL={pnl:.5f} | Result={result_type}")
+
+    if be_retry:
+        log_state(
+            f"STEP UNCHANGED | BE SL hit → retry same Step {current_step} | Lot={current_lot}"
+        )
+        log_state(f"Next Trade => {BOT_STATE['symbol']} {BOT_STATE['current_lot']} Lots")
+        return
 
     if pnl > 0:
         next_step = 1
@@ -3180,7 +3455,7 @@ def check_position_and_detect_closure():
                         BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                         BOT_STATE['last_pnl']    = pnl
 
-                        _apply_step_progression(pnl)
+                        _handle_close_step_progression(symbol, pnl)
                         save_bot_state_to_db()
                         log_state(f"STATE SAVED FOR ORDER: {completed_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3273,7 +3548,7 @@ def check_position_and_detect_closure():
                     BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                     BOT_STATE['last_pnl']    = pnl
 
-                    _apply_step_progression(pnl)
+                    _handle_close_step_progression(symbol, pnl)
                     save_bot_state_to_db()
                     log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3316,7 +3591,7 @@ def check_position_and_detect_closure():
                     BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                     BOT_STATE['last_pnl']    = pnl
 
-                    _apply_step_progression(pnl)
+                    _handle_close_step_progression(symbol, pnl)
                     save_bot_state_to_db()
 
                     fallback_data = {
@@ -3395,7 +3670,7 @@ def check_position_and_detect_closure():
                 BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                 BOT_STATE['last_pnl']    = pnl
 
-                _apply_step_progression(pnl)
+                _handle_close_step_progression(symbol, pnl)
                 save_bot_state_to_db()
                 log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3435,7 +3710,7 @@ def check_position_and_detect_closure():
                 BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                 BOT_STATE['last_pnl']    = pnl
 
-                _apply_step_progression(pnl)
+                _handle_close_step_progression(symbol, pnl)
                 save_bot_state_to_db()
 
                 fallback_data = {
@@ -3489,7 +3764,7 @@ def check_position_and_detect_closure():
                 BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                 BOT_STATE['last_pnl']    = pnl
 
-                _apply_step_progression(pnl)
+                _handle_close_step_progression(symbol, pnl)
                 save_bot_state_to_db()
                 log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3874,6 +4149,47 @@ def get_system_ip():
         return jsonify({'success': False, 'message': f'Error getting IP: {str(e)}'}), 500
 
 
+@app.route('/api/system-resources', methods=['GET'])
+def get_system_resources():
+    """Process memory + log sizes + MySQL storage — read-only, no trading impact."""
+    try:
+        mem_mb = _get_process_rss_mb()
+        mem_limit_mb = int(os.getenv('RENDER_MEMORY_LIMIT_MB', '512'))
+        warn_mb = int(os.getenv('MEMORY_WARN_MB', '400'))
+        mysql_quota_mb = float(os.getenv('MYSQL_QUOTA_MB', '256'))
+        db_stats = get_mysql_storage_stats()
+        used_mb = db_stats.get('used_mb')
+        return jsonify({
+            'success': True,
+            'memory': {
+                'rss_mb': mem_mb,
+                'limit_mb': mem_limit_mb,
+                'warn_mb': warn_mb,
+                'percent': round((mem_mb / mem_limit_mb) * 100, 1) if mem_mb is not None else None,
+                'status': (
+                    'critical' if mem_mb is not None and mem_mb >= warn_mb
+                    else 'ok' if mem_mb is not None
+                    else 'unknown'
+                ),
+            },
+            'logs': {
+                'trade_log_mb': _file_size_mb('trade.log'),
+                'server_log_mb': _file_size_mb('server.log'),
+                'max_mb': round(LOG_MAX_BYTES / (1024 * 1024), 1),
+            },
+            'mysql': {
+                'used_mb': used_mb,
+                'quota_mb': mysql_quota_mb,
+                'percent': round((used_mb / mysql_quota_mb) * 100, 1) if used_mb is not None and mysql_quota_mb > 0 else None,
+                'table_count': db_stats.get('table_count', 0),
+                'tables': db_stats.get('tables', []),
+                'error': db_stats.get('error'),
+            },
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
 @app.route('/api/start-bot', methods=['POST'])
 def start_bot():
     try:
@@ -3885,6 +4201,14 @@ def start_bot():
         tp_percent = data.get('tp_percent', 2.0)
         sl_percent = data.get('sl_percent', 1.0)
         symbol     = data.get('symbol', 'ADAUSD')
+        # Optional: allow start lot / streak on start; otherwise use saved LOT_STEPS
+        if data.get('start_lot') is not None or data.get('streak') is not None:
+            start_lot = data.get('start_lot', LOT_STEPS_META['start_lot'])
+            streak = data.get('streak', LOT_STEPS_META['streak'])
+            ok, result = apply_lot_steps_config(start_lot, streak)
+            if not ok:
+                return jsonify({'success': False, 'message': result}), 400
+            save_lot_steps_config_to_db(result)
         max_steps  = max(LOT_STEPS.keys())
 
         if not isinstance(leverage, int) or leverage < 1 or leverage > 200:
@@ -3900,7 +4224,9 @@ def start_bot():
         BOT_STATE['tp_percent'] = float(tp_percent)
         BOT_STATE['sl_percent'] = float(sl_percent)
         BOT_STATE['max_steps']  = max_steps
+        BOT_STATE['base_lot']   = LOT_STEPS[1]
         BOT_STATE['symbol']     = symbol.upper()
+        save_bot_config_to_db(get_bot_config())
 
         # FIX: make sure WS engine is (re)subscribed to THIS symbol before
         # we even check for an existing position on it.
@@ -4005,6 +4331,7 @@ def update_symbol():
             return jsonify({'success': False, 'message': f'Invalid symbol. Valid: {valid_symbols}'}), 400
         old_symbol          = BOT_STATE['symbol']
         BOT_STATE['symbol'] = new_symbol
+        save_bot_config_to_db(get_bot_config())
         print(f"📊 Symbol updated: {old_symbol} → {new_symbol}")
         # FIX: force WS engine to resync to the new symbol so fills/positions
         # for the OLD symbol never get attributed to the NEW one (and vice versa).
@@ -4111,7 +4438,9 @@ def get_bot_status():
                 'current_lot_size': current_lot_size,
                 'session_start_time': BOT_STATE['session_start_time'],
                 'session_total_pnl': BOT_STATE['session_total_pnl'],
-                'lot_steps': LOT_STEPS,
+                'lot_steps': dict(LOT_STEPS),
+                'start_lot': LOT_STEPS_META['start_lot'],
+                'streak': LOT_STEPS_META['streak'],
                 'cooldown_remaining_seconds': round(cooldown_remaining, 1),
                 'cooldown_seconds': COOLDOWN_SECONDS,
                 'order_completed': BOT_STATE['order_completed'],
@@ -4139,15 +4468,13 @@ def get_logs():
         limit = int(request.args.get('limit', 100))
         log_file = "trade.log"
         if not os.path.exists(log_file):
-            return jsonify({'success': True, 'logs': 'No trade logs found yet.'})
-        with open(log_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            last_lines = lines[-limit:]
-            return jsonify({
-                'success': True,
-                'logs': "".join(last_lines),
-                'total_lines': len(lines)
-            })
+            return jsonify({'success': True, 'logs': 'No trade logs found yet.', 'total_lines': 0})
+        last_lines, approx_total = _tail_read_lines(log_file, limit=limit)
+        return jsonify({
+            'success': True,
+            'logs': "\n".join(last_lines) + ("\n" if last_lines else ""),
+            'total_lines': approx_total,
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -4297,72 +4624,747 @@ def clear_all_signal_scores():
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
-# ========== GOOGLE HISTORY UI ==========
-@app.route('/google-history')
-def google_history():
-    return render_template('google_history.html')
+# =====================================================================
+# SIGNAL SCORES PnL (INFO ONLY)
+# Completely independent of fill-engine helpers (get_fills_page,
+# find_trade_by_order_id, wait_for_trade_fills, pre-order verify, etc.).
+# Runs ONLY when UI presses "See PnL".
+# =====================================================================
+def _ss_pnl_fetch_delta_fills(max_pages=40, page_size=50):
+    """Fetch fills from Delta Exchange for signal-score PnL display only."""
+    all_fills = []
+    after = None
+    for _ in range(max_pages):
+        endpoint = f'/fills?page_size={page_size}'
+        if after:
+            endpoint += f'&after={after}'
+        try:
+            resp = make_api_request('GET', endpoint)
+        except Exception as e:
+            log_error(f"[SS PnL] fills fetch error: {e}")
+            break
+        if not resp or not resp.get('result'):
+            break
+        batch = resp.get('result') or []
+        if not batch:
+            break
+        all_fills.extend(batch)
+        meta = resp.get('meta') or {}
+        after = meta.get('after')
+        if not after:
+            break
+    return all_fills
 
 
-@app.route('/api/google-trades', methods=['GET'])
-def get_google_trades():
+def _ss_pnl_group_orders(fills):
+    """Group raw fills by order_id → avg price / total size / side / timestamp."""
+    order_groups = {}
+    for fill in fills:
+        oid = str(fill.get('order_id') or fill.get('id') or '')
+        side = (fill.get('side') or '').lower()
+        try:
+            size = float(fill.get('size', 0) or 0)
+            price = float(fill.get('price', 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        created_at = fill.get('created_at') or ''
+        symbol = fill.get('product_symbol') or ''
+
+        if not oid or size <= 0 or price <= 0:
+            continue
+
+        if oid not in order_groups:
+            order_groups[oid] = {
+                'order_id': oid,
+                'side': side,
+                'symbol': symbol,
+                'total_size': 0.0,
+                'total_value': 0.0,
+                'avg_price': 0.0,
+                'timestamp': created_at,
+            }
+
+        grp = order_groups[oid]
+        grp['total_size'] += size
+        grp['total_value'] += price * size
+        if created_at and (not grp['timestamp'] or created_at < grp['timestamp']):
+            grp['timestamp'] = created_at
+        if symbol and not grp['symbol']:
+            grp['symbol'] = symbol
+
+    for grp in order_groups.values():
+        if grp['total_size'] > 0:
+            grp['avg_price'] = grp['total_value'] / grp['total_size']
+
+    return order_groups
+
+
+def _ss_pnl_formula(entry_side, entry_price, exit_price, lot_size, symbol):
+    """Same PnL formula as trading engine (info-only copy — does not call fill helpers)."""
+    lot_multiplier = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+    actual_quantity = float(lot_size) * float(lot_multiplier)
+    if entry_side == 'buy':
+        return (exit_price - (entry_price + fees)) * actual_quantity
+    return ((entry_price - fees) - exit_price) * actual_quantity
+
+
+def _ss_pnl_find_exit_for_entry(order_groups, entry_oid):
+    """
+    Given entry order_id, find its exit pair in Delta fills:
+    opposite side, exit_time >= entry_time, nearest later exit.
+    """
+    entry = order_groups.get(str(entry_oid))
+    if not entry:
+        return None, None
+
+    candidates = []
+    for oid, grp in order_groups.items():
+        if oid == str(entry_oid):
+            continue
+        if grp.get('symbol') and entry.get('symbol') and grp['symbol'] != entry['symbol']:
+            continue
+        if grp['side'] == entry['side']:
+            continue
+        if not grp['timestamp'] or not entry['timestamp']:
+            continue
+        if grp['timestamp'] < entry['timestamp']:
+            continue
+        candidates.append(grp)
+
+    if not candidates:
+        return entry, None
+
+    candidates.sort(key=lambda g: g['timestamp'])
+    return entry, candidates[0]
+
+
+def _ss_pnl_position_is_live(symbol):
+    """Best-effort live check for the latest signal row only (read-only)."""
     try:
-        limit = int(request.args.get('limit', 100))
-        offset = int(request.args.get('offset', 0))
-        search = request.args.get('search', None)
-        sort_by = request.args.get('sort_by', 'created_at')
-        sort_order = request.args.get('sort_order', 'desc')
-        
-        trades = google_integration.get_trades_from_sheet(
-            limit=limit, offset=offset, search=search, 
-            sort_by=sort_by, sort_order=sort_order
-        )
-        
-        return jsonify({'success': True, 'trades': trades})
+        if not symbol:
+            return False
+        product_id = get_product_id(symbol)
+        if product_id:
+            pos = check_position_realtime(product_id, expected_symbol=symbol)
+            if isinstance(pos, dict) and not pos.get('error') and pos.get('has_position'):
+                return True
+        if BOT_STATE.get('running') and not BOT_STATE.get('order_completed', True):
+            if (BOT_STATE.get('symbol') or '').upper() == (symbol or '').upper():
+                return True
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error: {str(e)}', 'trades': []})
+        log_error(f"[SS PnL] live check error: {e}")
+    return False
 
 
-@app.route('/api/google-signals', methods=['GET'])
-def get_google_signals():
+@app.route('/api/signal-scores-pnl', methods=['GET'])
+def signal_scores_pnl():
+    """
+    On-demand: fetch Delta fills, pair each signal_scores_history.order_id
+    with its exit, compute PnL. Does not modify any fill-engine state.
+    """
     try:
-        limit = int(request.args.get('limit', 100))
-        offset = int(request.args.get('offset', 0))
-        search = request.args.get('search', None)
-        sort_by = request.args.get('sort_by', 'created_at')
-        sort_order = request.args.get('sort_order', 'desc')
-        
-        signals = google_integration.get_signals_from_sheet(
-            limit=limit, offset=offset, search=search, 
-            sort_by=sort_by, sort_order=sort_order
+        rows = execute_mysql_query(
+            '''
+            SELECT order_id, symbol, position, lot_size, entry_time, created_at
+            FROM signal_scores_history
+            ORDER BY created_at DESC
+            ''',
+            fetch_all=True
+        ) or []
+
+        fills = _ss_pnl_fetch_delta_fills()
+        order_groups = _ss_pnl_group_orders(fills)
+
+        latest_oid = str(rows[0]['order_id']) if rows else None
+        latest_symbol = rows[0]['symbol'] if rows else None
+
+        # Pair oldest→newest so each exit is consumed once (avoids wrong pairs)
+        used_exit_oids = set()
+        pair_cache = {}  # entry_oid -> (entry, exit_or_None)
+
+        chronological = sorted(
+            rows,
+            key=lambda r: (r.get('entry_time') or r.get('created_at') or '', str(r['order_id']))
         )
-        
-        return jsonify({'success': True, 'signals': signals})
+        for r in chronological:
+            oid = str(r['order_id'])
+            entry, exit_ord = _ss_pnl_find_exit_for_entry(order_groups, oid)
+            if exit_ord and exit_ord['order_id'] in used_exit_oids:
+                # find next unused opposite-side exit after entry
+                exit_ord = None
+                if entry:
+                    for cand_oid, grp in sorted(
+                        order_groups.items(),
+                        key=lambda kv: kv[1].get('timestamp') or ''
+                    ):
+                        if cand_oid == oid:
+                            continue
+                        if cand_oid in used_exit_oids:
+                            continue
+                        if grp.get('symbol') and entry.get('symbol') and grp['symbol'] != entry['symbol']:
+                            continue
+                        if grp['side'] == entry['side']:
+                            continue
+                        if not grp['timestamp'] or not entry['timestamp']:
+                            continue
+                        if grp['timestamp'] < entry['timestamp']:
+                            continue
+                        exit_ord = grp
+                        break
+            if exit_ord:
+                used_exit_oids.add(exit_ord['order_id'])
+            pair_cache[oid] = (entry, exit_ord)
+
+        live_flag = False
+        if latest_oid:
+            entry, exit_ord = pair_cache.get(latest_oid, (None, None))
+            no_exit = entry is not None and exit_ord is None
+            exchange_live = _ss_pnl_position_is_live(latest_symbol)
+            entry_missing = entry is None and (
+                BOT_STATE.get('last_placed_order_id') is not None
+                and str(BOT_STATE.get('last_placed_order_id')) == latest_oid
+                and not BOT_STATE.get('order_completed', True)
+            )
+            live_flag = bool(no_exit or exchange_live or entry_missing)
+
+        results = {}
+        for r in rows:
+            oid = str(r['order_id'])
+            symbol = r['symbol']
+            entry, exit_ord = pair_cache.get(oid, (None, None))
+
+            if oid == latest_oid and live_flag:
+                results[oid] = {
+                    'status': 'live',
+                    'pnl': None,
+                    'tag': 'POSITION IS CURRENTLY LIVE',
+                    'entry_order_id': oid,
+                    'exit_order_id': None,
+                    'entry_price': entry['avg_price'] if entry else None,
+                    'exit_price': None,
+                    'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                }
+                continue
+
+            if not entry:
+                results[oid] = {
+                    'status': 'not_found',
+                    'pnl': None,
+                    'tag': 'fills not found',
+                    'entry_order_id': oid,
+                    'exit_order_id': None,
+                    'entry_price': None,
+                    'exit_price': None,
+                    'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                }
+                continue
+
+            if not exit_ord:
+                results[oid] = {
+                    'status': 'pending',
+                    'pnl': None,
+                    'tag': 'exit pending',
+                    'entry_order_id': oid,
+                    'exit_order_id': None,
+                    'entry_price': entry['avg_price'],
+                    'exit_price': None,
+                    'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                }
+                continue
+
+            lot_size = min(entry['total_size'], exit_ord['total_size'])
+            pnl = _ss_pnl_formula(
+                entry['side'], entry['avg_price'], exit_ord['avg_price'], lot_size, symbol
+            )
+            results[oid] = {
+                'status': 'closed',
+                'pnl': round(float(pnl), 8),
+                'tag': 'PROFIT' if pnl > 0 else 'LOSS',
+                'entry_order_id': oid,
+                'exit_order_id': exit_ord['order_id'],
+                'entry_price': entry['avg_price'],
+                'exit_price': exit_ord['avg_price'],
+                'entry_side': entry['side'],
+                'lot_size': lot_size,
+            }
+
+        return jsonify({
+            'success': True,
+            'fills_fetched': len(fills),
+            'orders_grouped': len(order_groups),
+            'pnl_by_order_id': results,
+        })
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error: {str(e)}', 'signals': []})
+        log_error(f"[SS PnL] endpoint error: {e}")
+        return jsonify({'success': False, 'message': str(e), 'pnl_by_order_id': {}})
 
 
+@app.route('/api/guardian-config', methods=['GET'])
+def api_get_guardian_config():
+    """TP/SL guardian + break-even settings. Independent of bot ON/OFF."""
+    try:
+        return jsonify({'success': True, 'config': get_guardian_config()})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
-# _break_even_applied_lock ADD karo
-_break_even_applied      = {}
-_break_even_applied_lock = Lock()
+@app.route('/api/guardian-config', methods=['POST'])
+def api_save_guardian_config():
+    """Save guardian settings permanently (survives bot stop/start + process restart)."""
+    try:
+        data = request.get_json() or {}
+        ok, result = apply_guardian_config(data)
+        if not ok:
+            return jsonify({'success': False, 'message': result}), 400
+        return jsonify({'success': True, 'message': 'Guardian settings saved', 'config': result})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
-# ========== TP/SL GUARDIAN CONFIG ==========
-LIVE_TP_PERCENTAGE        = 2
-LIVE_SL_PERCENTAGE        = 1
-LIQUIDATION_PROTECTION    = "Y"
-# LIQUIDATION_BUFFER        = 0.15
-LIQUIDATION_BUFFER        = 0.2
 
-# ========== BREAK-EVEN CONFIG ==========
-BREAK_EVEN_ENABLED         = True
-BREAK_EVEN_TRIGGER_PERCENT = 0.5    # TP ka kitna % travel hone pe BE activate ho
-BREAK_EVEN_TRIGGER_BUFFER  = 4    # Half-TP se itna pehle trigger ho (USD)
-BREAK_EVEN_PROFIT_OFFSET   = 3.5      # Entry ke upar SL kitna rakho (USD)
+@app.route('/api/lot-steps-config', methods=['GET'])
+def api_get_lot_steps_config():
+    """Start lot + streak → martingale LOT_STEPS. Independent of bot ON/OFF."""
+    try:
+        return jsonify({'success': True, 'config': get_lot_steps_config()})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/lot-steps-config', methods=['POST'])
+def api_save_lot_steps_config():
+    """Rebuild LOT_STEPS from start_lot + streak. Does not change win/loss reset logic."""
+    try:
+        data = request.get_json() or {}
+        start_lot = data.get('start_lot', LOT_STEPS_META['start_lot'])
+        streak = data.get('streak', LOT_STEPS_META['streak'])
+        ok, result = apply_lot_steps_config(start_lot, streak)
+        if not ok:
+            return jsonify({'success': False, 'message': result}), 400
+        save_lot_steps_config_to_db(result)
+        return jsonify({'success': True, 'message': 'Lot steps saved', 'config': result})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/bot-config', methods=['GET'])
+def api_get_bot_config():
+    """Trading pair, leverage, TP/SL — persisted in MySQL."""
+    try:
+        return jsonify({'success': True, 'config': get_bot_config()})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/bot-config', methods=['POST'])
+def api_save_bot_config():
+    """Save bot UI config without starting engine."""
+    try:
+        data = request.get_json() or {}
+        ok, result = apply_bot_config(data)
+        if not ok:
+            return jsonify({'success': False, 'message': result}), 400
+        return jsonify({'success': True, 'message': 'Bot config saved', 'config': result})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# ========== DECISION TIMEFRAMES (UI-editable, DB-persisted) ==========
+# Which TFs must align for final BUY/SELL. Bot ON/OFF se reset NAHI.
+# Sirf generate_smart_signal decision gate pe lagta hai — placement/bot loop untouched.
+# Default = current hardcoded confluence (4H + 15M + 30M + 1H + 2H).
+DECISION_TF_KEYS = ('1m', '5m', '15m', '30m', '1h', '2h', '4h', '1d')
+# Highest → lowest (master = first enabled with BUY/SELL)
+DECISION_TF_PRIORITY = ('1d', '4h', '2h', '1h', '30m', '15m', '5m', '1m')
+DECISION_TF_DEFAULTS = {
+    '1m': False,
+    '5m': False,
+    '15m': True,
+    '30m': True,
+    '1h': True,
+    '2h': True,
+    '4h': True,
+    '1d': False,
+}
+DECISION_TF_CONFIG = dict(DECISION_TF_DEFAULTS)
+_decision_tf_lock = Lock()
+
+
+def get_decision_tf_config():
+    with _decision_tf_lock:
+        return dict(DECISION_TF_CONFIG)
+
+
+def save_decision_tf_config_to_db(cfg=None):
+    try:
+        data = cfg if cfg is not None else get_decision_tf_config()
+        payload = {k: bool(data.get(k, False)) for k in DECISION_TF_KEYS}
+        payload['saved_at'] = datetime.now().isoformat()
+        upsert_query = '''
+            INSERT INTO bot_state (state_key, state_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
+        '''
+        execute_mysql_query(upsert_query, ('decision_tf_config', json.dumps(payload)), commit=True)
+        enabled = [k.upper() for k in DECISION_TF_PRIORITY if payload.get(k)]
+        log_system(f"DECISION TF SAVED | enabled={enabled or ['(none)']}")
+        return True
+    except Exception as e:
+        log_error(f"Saving decision TF config: {e}")
+        return False
+
+
+def load_decision_tf_config_from_db():
+    global DECISION_TF_CONFIG
+    try:
+        result = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('decision_tf_config',),
+            fetch_one=True
+        )
+        if not result or not result.get('state_value'):
+            log_system("No saved decision TF config — using defaults, writing to DB")
+            save_decision_tf_config_to_db(DECISION_TF_DEFAULTS)
+            return False
+
+        saved = json.loads(result['state_value'])
+        with _decision_tf_lock:
+            for key in DECISION_TF_KEYS:
+                if key in saved:
+                    val = saved[key]
+                    if isinstance(val, str):
+                        DECISION_TF_CONFIG[key] = val.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                    else:
+                        DECISION_TF_CONFIG[key] = bool(val)
+        enabled = [k.upper() for k in DECISION_TF_PRIORITY if DECISION_TF_CONFIG.get(k)]
+        log_system(f"DECISION TF LOADED | enabled={enabled or ['(none)']}")
+        return True
+    except Exception as e:
+        log_error(f"Loading decision TF config: {e}")
+        return False
+
+
+def apply_decision_tf_config(data: dict):
+    """Validate + apply UI payload. At least one TF required. Returns (ok, cfg_or_msg)."""
+    try:
+        new_cfg = {}
+        for key in DECISION_TF_KEYS:
+            val = data.get(key, DECISION_TF_CONFIG.get(key, False))
+            if isinstance(val, str):
+                new_cfg[key] = val.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+            else:
+                new_cfg[key] = bool(val)
+        if not any(new_cfg.values()):
+            return False, 'Select at least one timeframe for final decision'
+        with _decision_tf_lock:
+            DECISION_TF_CONFIG.update(new_cfg)
+        save_decision_tf_config_to_db(new_cfg)
+        return True, new_cfg
+    except Exception as e:
+        return False, f'Invalid values: {e}'
+
+
+def _decision_tf_bias_net(score_map, key):
+    r = score_map.get(key)
+    if not r:
+        return 'NEUTRAL', 0
+    return r.get('bias', 'NEUTRAL'), int(r.get('net', 0) or 0)
+
+
+def _resolve_signal_from_selected_tfs(score_map, timeframe_scores, reason):
+    """
+    Final decision gate using only user-selected timeframes.
+    Does not place orders / touch bot loop — only returns signal or WAIT.
+    Returns (direction_or_None, wait_response_or_None).
+    """
+    tf_cfg = get_decision_tf_config()
+    enabled = [t for t in DECISION_TF_PRIORITY if tf_cfg.get(t)]
+    print(f"\n🎯 DECISION TFs (saved): {[t.upper() for t in enabled] or ['(none)']}")
+
+    if not enabled:
+        return None, _make_wait_signal(
+            reason,
+            "No decision timeframes enabled — save at least one in Decision Timeframes",
+            timeframe_scores=timeframe_scores
+        )
+
+    master = None
+    master_tf = None
+    for t in enabled:
+        bias, _ = _decision_tf_bias_net(score_map, t)
+        if bias in ('BUY', 'SELL'):
+            master, master_tf = bias, t
+            break
+
+    if not master:
+        return None, _make_wait_signal(
+            reason,
+            f"All selected TFs NEUTRAL ({', '.join(t.upper() for t in enabled)})",
+            timeframe_scores=timeframe_scores
+        )
+
+    print(f"   Master = {master_tf.upper()} → {master}")
+
+    mismatched = []
+    for t in enabled:
+        bias, _ = _decision_tf_bias_net(score_map, t)
+        if bias != master:
+            mismatched.append(f"{t.upper()}={bias}")
+    if mismatched:
+        why = f"Waiting for {', '.join(mismatched)} to align with {master_tf.upper()} {master}"
+        print(f"⏳ Confluence fail — {why}")
+        return None, _make_wait_signal(reason, why, timeframe_scores=timeframe_scores)
+
+    # Strength: prefer 15M if selected, else lowest selected TF
+    if '15m' in enabled:
+        entry_tf = '15m'
+        min_net = 4
+    else:
+        entry_tf = enabled[-1]  # lowest priority among enabled
+        min_net = 4
+    _, entry_net = _decision_tf_bias_net(score_map, entry_tf)
+    if abs(entry_net) < min_net:
+        why = f"{entry_tf.upper()} net={entry_net} too weak (need >={min_net})"
+        print(f"⏳ {why}")
+        return None, _make_wait_signal(reason, why, timeframe_scores=timeframe_scores)
+
+    aligned = '+'.join(t.upper() for t in enabled)
+    print(f"\n✅ {aligned} aligned on {master} — SIGNAL: {master}")
+    return master, None
+
+
+@app.route('/api/decision-tf-config', methods=['GET'])
+def api_get_decision_tf_config():
+    try:
+        return jsonify({'success': True, 'config': get_decision_tf_config()})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/decision-tf-config', methods=['POST'])
+def api_save_decision_tf_config():
+    try:
+        data = request.get_json() or {}
+        ok, result = apply_decision_tf_config(data)
+        if not ok:
+            return jsonify({'success': False, 'message': result}), 400
+        return jsonify({'success': True, 'message': 'Decision timeframes saved', 'config': result})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# ========== TP/SL + BREAK-EVEN CONFIG (UI-editable, DB-persisted) ==========
+# Defaults — UI/API se change hote hain. Bot ON/OFF se reset NAHI hote.
+# Sirf jab UI se Save ho tab update. Process restart pe DB se load.
+GUARDIAN_CONFIG_DEFAULTS = {
+    'live_tp_percentage': 2.0,
+    'live_sl_percentage': 1.0,
+    'liquidation_protection': 'Y',
+    'liquidation_buffer': 0.2,
+    'break_even_enabled': True,
+    'break_even_trigger_percent': 0.5,   # TP ka kitna % travel hone pe BE activate
+    'break_even_trigger_buffer': 4.0,    # Half-TP se itna pehle trigger (USD)
+    'break_even_profit_offset': 3.5,     # Entry ke upar/niche SL offset (USD) — BE ONLY, fees se ab alag
+    'break_even_retry_same_step': False, # BE SL hit → same step/lot (no double); PnL history unchanged
+    'trading_fees': 3.5,                 # Per-side fee jo PnL formula me use hoti hai (replaces hardcoded `fees`)
+}
+GUARDIAN_CONFIG = dict(GUARDIAN_CONFIG_DEFAULTS)
+_guardian_config_lock = Lock()
+
+
+def get_guardian_config():
+    with _guardian_config_lock:
+        return dict(GUARDIAN_CONFIG)
+
+
+def save_guardian_config_to_db(cfg=None):
+    try:
+        data = cfg if cfg is not None else get_guardian_config()
+        payload = dict(data)
+        payload['saved_at'] = datetime.now().isoformat()
+        upsert_query = '''
+            INSERT INTO bot_state (state_key, state_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
+        '''
+        execute_mysql_query(upsert_query, ('guardian_config', json.dumps(payload)), commit=True)
+        log_system(
+            f"GUARDIAN CONFIG SAVED | TP={payload.get('live_tp_percentage')}% "
+            f"SL={payload.get('live_sl_percentage')}% "
+            f"Liq={payload.get('liquidation_protection')} "
+            f"Buf={payload.get('liquidation_buffer')} "
+            f"BE={payload.get('break_even_enabled')} "
+            f"BE%={payload.get('break_even_trigger_percent')} "
+            f"BE_buf={payload.get('break_even_trigger_buffer')} "
+            f"BE_offset={payload.get('break_even_profit_offset')} "
+            f"BE_retry={payload.get('break_even_retry_same_step')} "
+            f"Fees={payload.get('trading_fees')}"
+        )
+        return True
+    except Exception as e:
+        log_error(f"Saving guardian config: {e}")
+        return False
+
+
+def load_guardian_config_from_db():
+    global GUARDIAN_CONFIG, fees
+    try:
+        result = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('guardian_config',),
+            fetch_one=True
+        )
+        if not result or not result.get('state_value'):
+            log_system("No saved guardian config — using defaults, writing to DB")
+            save_guardian_config_to_db(GUARDIAN_CONFIG_DEFAULTS)
+            fees = GUARDIAN_CONFIG_DEFAULTS['trading_fees']
+            return False
+
+        saved = json.loads(result['state_value'])
+        with _guardian_config_lock:
+            for key in GUARDIAN_CONFIG_DEFAULTS:
+                if key in saved:
+                    GUARDIAN_CONFIG[key] = saved[key]
+            # type-normalize
+            GUARDIAN_CONFIG['live_tp_percentage'] = float(GUARDIAN_CONFIG['live_tp_percentage'])
+            GUARDIAN_CONFIG['live_sl_percentage'] = float(GUARDIAN_CONFIG['live_sl_percentage'])
+            GUARDIAN_CONFIG['liquidation_protection'] = str(GUARDIAN_CONFIG['liquidation_protection']).strip().upper()
+            GUARDIAN_CONFIG['liquidation_buffer'] = float(GUARDIAN_CONFIG['liquidation_buffer'])
+            GUARDIAN_CONFIG['break_even_enabled'] = bool(GUARDIAN_CONFIG['break_even_enabled'])
+            GUARDIAN_CONFIG['break_even_trigger_percent'] = float(GUARDIAN_CONFIG['break_even_trigger_percent'])
+            GUARDIAN_CONFIG['break_even_trigger_buffer'] = float(GUARDIAN_CONFIG['break_even_trigger_buffer'])
+            GUARDIAN_CONFIG['break_even_profit_offset'] = float(GUARDIAN_CONFIG['break_even_profit_offset'])
+            GUARDIAN_CONFIG['break_even_retry_same_step'] = bool(
+                GUARDIAN_CONFIG.get('break_even_retry_same_step', False)
+            )
+            GUARDIAN_CONFIG['trading_fees'] = float(GUARDIAN_CONFIG.get('trading_fees', 3.5))
+
+        # PnL formula (exit-(entry+fees)) bilkul unchanged hai — sirf fees value ka source
+        # hardcoded 3.5 se hatakar is config field pe move kiya hai.
+        fees = GUARDIAN_CONFIG['trading_fees']
+
+        log_system(
+            f"GUARDIAN CONFIG LOADED | TP={GUARDIAN_CONFIG['live_tp_percentage']}% "
+            f"SL={GUARDIAN_CONFIG['live_sl_percentage']}% "
+            f"BE_offset={GUARDIAN_CONFIG['break_even_profit_offset']} "
+            f"BE_retry={GUARDIAN_CONFIG['break_even_retry_same_step']} "
+            f"Fees={GUARDIAN_CONFIG['trading_fees']}"
+        )
+        return True
+    except Exception as e:
+        log_error(f"Loading guardian config: {e}")
+        return False
+
+
+def apply_guardian_config(data: dict):
+    """Validate + apply UI/API payload into memory and DB. Returns (ok, message_or_cfg)."""
+    global fees
+    try:
+        tp = float(data.get('live_tp_percentage', GUARDIAN_CONFIG['live_tp_percentage']))
+        sl = float(data.get('live_sl_percentage', GUARDIAN_CONFIG['live_sl_percentage']))
+        liq = str(data.get('liquidation_protection', GUARDIAN_CONFIG['liquidation_protection'])).strip().upper()
+        liq_buf = float(data.get('liquidation_buffer', GUARDIAN_CONFIG['liquidation_buffer']))
+        be_en = data.get('break_even_enabled', GUARDIAN_CONFIG['break_even_enabled'])
+        if isinstance(be_en, str):
+            be_en = be_en.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        else:
+            be_en = bool(be_en)
+        be_pct = float(data.get('break_even_trigger_percent', GUARDIAN_CONFIG['break_even_trigger_percent']))
+        be_buf = float(data.get('break_even_trigger_buffer', GUARDIAN_CONFIG['break_even_trigger_buffer']))
+        be_off = float(data.get('break_even_profit_offset', GUARDIAN_CONFIG['break_even_profit_offset']))
+        be_retry = data.get('break_even_retry_same_step', GUARDIAN_CONFIG['break_even_retry_same_step'])
+        if isinstance(be_retry, str):
+            be_retry = be_retry.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        else:
+            be_retry = bool(be_retry)
+        trading_fees = float(data.get('trading_fees', GUARDIAN_CONFIG.get('trading_fees', 3.5)))
+
+        if not (0.1 <= tp <= 50):
+            return False, 'TP % must be between 0.1 and 50'
+        if not (0.1 <= sl <= 50):
+            return False, 'SL % must be between 0.1 and 50'
+        if liq not in ('Y', 'N'):
+            return False, 'Liquidation protection must be Y or N'
+        if not (0 <= liq_buf <= 50):
+            return False, 'Liquidation buffer must be between 0 and 50'
+        if not (0.05 <= be_pct <= 1.0):
+            return False, 'BE trigger % must be between 0.05 and 1.0'
+        if not (0 <= be_buf <= 500):
+            return False, 'BE trigger buffer must be between 0 and 500'
+        if not (0 <= be_off <= 500):
+            return False, 'BE profit offset must be between 0 and 500'
+        if not (0 <= trading_fees <= 50):
+            return False, 'Trading fees must be between 0 and 50'
+
+        new_cfg = {
+            'live_tp_percentage': tp,
+            'live_sl_percentage': sl,
+            'liquidation_protection': liq,
+            'liquidation_buffer': liq_buf,
+            'break_even_enabled': be_en,
+            'break_even_trigger_percent': be_pct,
+            'break_even_trigger_buffer': be_buf,
+            'break_even_profit_offset': be_off,
+            'break_even_retry_same_step': be_retry,
+            'trading_fees': trading_fees,
+        }
+        with _guardian_config_lock:
+            GUARDIAN_CONFIG.update(new_cfg)
+        save_guardian_config_to_db(new_cfg)
+        # PnL formula unchanged — sirf value ka source ab yahan se aata hai.
+        fees = trading_fees
+        return True, new_cfg
+    except (TypeError, ValueError) as e:
+        return False, f'Invalid values: {e}'
+
 
 # ========== BREAK-EVEN STATE TRACKER ==========
 # key = product_id, value = be_new_sl price (float) or None
-_break_even_applied = {}
+_break_even_applied      = {}
+_positions_had_be_sl     = set()   # product_ids that had BE SL applied (for retry-same-step)
+_be_retry_pending        = {}      # symbol -> True after BE SL close (pre-order verify reads this)
+_break_even_applied_lock = Lock()
+
+
+def _resolve_be_retry_on_close(symbol):
+    """BE SL close + setting ON → same step retry (consumes product flag)."""
+    gcfg = get_guardian_config()
+    if not gcfg.get('break_even_retry_same_step'):
+        return False
+    product_id = get_product_id(symbol)
+    if not product_id:
+        return False
+    pid = str(product_id)
+    with _break_even_applied_lock:
+        if pid in _positions_had_be_sl:
+            _positions_had_be_sl.discard(pid)
+            return True
+    return False
+
+
+def _mark_be_retry_pending(symbol):
+    with _break_even_applied_lock:
+        _be_retry_pending[symbol] = True
+
+
+def _pop_be_retry_pending(symbol):
+    with _break_even_applied_lock:
+        return _be_retry_pending.pop(symbol, False)
+
+
+def _handle_close_step_progression(symbol, pnl):
+    """On close: BE SL + setting ON + loss → same step/lot; TP after BE = normal win."""
+    be_retry = False
+    gcfg = get_guardian_config()
+    if gcfg.get('break_even_retry_same_step') and pnl <= 0:
+        be_retry = _resolve_be_retry_on_close(symbol)
+    elif pnl > 0:
+        product_id = get_product_id(symbol)
+        if product_id:
+            with _break_even_applied_lock:
+                _positions_had_be_sl.discard(str(product_id))
+    _apply_step_progression(pnl, be_retry=be_retry)
+    if be_retry:
+        _mark_be_retry_pending(symbol)
 
 # ========== TP/SL GUARDIAN (with real-time mark price) ==========
 # UPDATED VERSION — fixes Break-Even not triggering issue
@@ -4404,6 +5406,17 @@ def auto_tp_sl_guardian():
                     if pid not in active_ids:
                         del _break_even_applied[pid]
 
+            # Snapshot config once per cycle — UI changes apply next cycle (≤2s)
+            gcfg = get_guardian_config()
+            live_tp_pct = float(gcfg['live_tp_percentage'])
+            live_sl_pct = float(gcfg['live_sl_percentage'])
+            liq_protect = str(gcfg['liquidation_protection']).strip().upper()
+            liq_buffer = float(gcfg['liquidation_buffer'])
+            be_enabled = bool(gcfg['break_even_enabled'])
+            be_trig_pct = float(gcfg['break_even_trigger_percent'])
+            be_trig_buf = float(gcfg['break_even_trigger_buffer'])
+            be_profit_off = float(gcfg['break_even_profit_offset'])
+
             for pos in active_positions:
                 try:
                     symbol     = pos.get("product_symbol") or pos.get("symbol")
@@ -4417,11 +5430,11 @@ def auto_tp_sl_guardian():
                     pos_key = str(product_id)
 
                     if size > 0:
-                        expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
-                        expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
+                        expected_tp = entry * (1 + live_tp_pct / 100)
+                        expected_sl = entry * (1 - live_sl_pct / 100)
                     else:
-                        expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
-                        expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
+                        expected_tp = entry * (1 - live_tp_pct / 100)
+                        expected_sl = entry * (1 + live_sl_pct / 100)
 
                     
 
@@ -4431,14 +5444,14 @@ def auto_tp_sl_guardian():
                     final_sl = expected_sl
 
                     # ── Liquidation protection ────────────────────────────
-                    if str(LIQUIDATION_PROTECTION).strip().upper() == "Y":
+                    if liq_protect == "Y":
                         try:
                             liquidation_price_raw = pos.get("liquidation_price")
                             if liquidation_price_raw is not None:
                                 liquidation_price = float(liquidation_price_raw)
                                 if size > 0:
                                     if expected_sl <= liquidation_price:
-                                        final_sl = round_price_2dp(liquidation_price + LIQUIDATION_BUFFER)
+                                        final_sl = round_price_2dp(liquidation_price + liq_buffer)
                                         log_system(
                                             f"[LIQ PROTECT] LONG {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/below "
@@ -4447,7 +5460,7 @@ def auto_tp_sl_guardian():
                                         )
                                 else:
                                     if expected_sl >= liquidation_price:
-                                        final_sl = round_price_2dp(liquidation_price - LIQUIDATION_BUFFER)
+                                        final_sl = round_price_2dp(liquidation_price - liq_buffer)
                                         log_system(
                                             f"[LIQ PROTECT] SHORT {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/above "
@@ -4462,7 +5475,7 @@ def auto_tp_sl_guardian():
                     with _break_even_applied_lock:
                         be_already_done = _break_even_applied.get(pos_key) is not None
 
-                    if BREAK_EVEN_ENABLED and not be_already_done:
+                    if be_enabled and not be_already_done:
                         try:
                             # ═══════════════════════════════════════════════
                             # FIX: REST FIRST (reliable, fresh), WS = backup only
@@ -4501,9 +5514,9 @@ def auto_tp_sl_guardian():
                             if live_price is not None:
                                 if size > 0:  # LONG
                                     tp_distance   = expected_tp - entry
-                                    half_distance = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
-                                    be_trigger    = round_price_2dp(entry + half_distance - BREAK_EVEN_TRIGGER_BUFFER)
-                                    be_new_sl     = round_price_2dp(entry + BREAK_EVEN_PROFIT_OFFSET)
+                                    half_distance = tp_distance * be_trig_pct
+                                    be_trigger    = round_price_2dp(entry + half_distance - be_trig_buf)
+                                    be_new_sl     = round_price_2dp(entry + be_profit_off)
 
                                     # DEBUG LOG — throttled to once per 10s per position (FIX: was
                                     # logging every 2s forever -> disk growth over many days)
@@ -4526,9 +5539,9 @@ def auto_tp_sl_guardian():
 
                                 else:  # SHORT
                                     tp_distance   = entry - expected_tp
-                                    half_distance = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
-                                    be_trigger    = round_price_2dp(entry - half_distance + BREAK_EVEN_TRIGGER_BUFFER)
-                                    be_new_sl     = round_price_2dp(entry - BREAK_EVEN_PROFIT_OFFSET)
+                                    half_distance = tp_distance * be_trig_pct
+                                    be_trigger    = round_price_2dp(entry - half_distance + be_trig_buf)
+                                    be_new_sl     = round_price_2dp(entry - be_profit_off)
 
                                     # DEBUG LOG — throttled (see note above)
                                     log_throttled(
@@ -4743,6 +5756,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
                 # CHANGE 1: True ki jagah be_new_sl price store karo
                 with _break_even_applied_lock:
                     _break_even_applied[pos_key] = be_new_sl
+                    _positions_had_be_sl.add(pos_key)
                 be_sl_set = True
                 break
         except Exception:
@@ -4773,6 +5787,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
                 # CHANGE 1: True ki jagah be_new_sl price store karo
                 with _break_even_applied_lock:
                     _break_even_applied[pos_key] = be_new_sl
+                    _positions_had_be_sl.add(pos_key)
         except Exception:
             pass
 
@@ -4780,6 +5795,18 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
 # ========== MAIN ==========
 if __name__ == '__main__':
     init_database()
+
+    print("Loading guardian config from DB...")
+    load_guardian_config_from_db()
+
+    print("Loading lot steps config from DB...")
+    load_lot_steps_config_from_db()
+
+    print("Loading bot config from DB...")
+    load_bot_config_from_db()
+
+    print("Loading decision timeframe config from DB...")
+    load_decision_tf_config_from_db()
 
     print("Starting keepalive for Render...")
     start_keep_alive()
@@ -4831,7 +5858,7 @@ if __name__ == '__main__':
 
     try:
         print("👉 http://127.0.0.1:8090")
-        app.run(debug=True, host='0.0.0.0', port=8090, use_reloader=False)
+        app.run(debug=False, host='0.0.0.0', port=8090, use_reloader=False)
     finally:
         print("Stopping signal bot...")
         stop_signal_bot()
