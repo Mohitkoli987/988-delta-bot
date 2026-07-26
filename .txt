@@ -1,0 +1,39 @@
+
+MYSQL_POOL = PooledDB(
+    creator=pymysql,
+    maxconnections=4,       # stay safely under server limit of 5
+    mincached=1,
+    maxcached=4,
+    maxshared=0,
+    blocking=True,          # wait for a free connection instead of erroring
+    maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
+    setsession=[],
+    ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
+    host=os.getenv('MYSQL_HOST', 'bz4nf1aycs9arstd4y4l-mysql.services.clever-cloud.com'),
+    port=int(os.getenv('MYSQL_PORT', 3306)),
+    user=os.getenv('MYSQL_USER', 'uhfemavaz7iyjcnh'),
+    password=os.getenv('MYSQL_PASSWORD', 'jVj84ZmtLAPJ50xJnMUJ'),
+    database=os.getenv('MYSQL_DB', 'bz4nf1aycs9arstd4y4l'),
+    charset='utf8mb4',
+    cursorclass=pymysql.cursors.DictCursor,
+    autocommit=False,
+    ssl={}
+)
+
+
+# gmail mohitkoli988
+DELTA_API_KEY=m42C5q6PBRlF6XlzqfBSrPJfHtnysy
+DELTA_API_SECRET=eah3KMJyOXuzMfXUBFQFqnj87hMmpJutkYfWRU4Ky61fcscLGWVhshuINyQi
+
+
+
+
+
+MYSQL_HOST=bz4nf1aycs9arstd4y4l-mysql.services.clever-cloud.com
+MYSQL_PORT=3306
+MYSQL_USER=uhfemavaz7iyjcnh
+MYSQL_PASSWORD=YOUR_MYSQL_PASSWORD
+MYSQL_DB=bz4nf1aycs9arstd4y4l
+
+DELTA_API_KEY=YOUR_DELTA_API_KEY
+DELTA_API_SECRET=YOUR_DELTA_API_SECRET

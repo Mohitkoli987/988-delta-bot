@@ -20,6 +20,7 @@ import time as _time
 import random
 from datetime import datetime
 import websocket
+import bot_manager
 
 # ========== LOGGING CONFIGURATION ==========
 LOG_MAX_BYTES = 20_000_000  # 20MB cap per log file
@@ -261,11 +262,11 @@ MYSQL_POOL = PooledDB(
     maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
     setsession=[],
     ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
-    host=os.getenv('MYSQL_HOST', 'bz4nf1aycs9arstd4y4l-mysql.services.clever-cloud.com'),
+    host=os.getenv('MYSQL_HOST', 'bqebck7vtzt0e6ugzqsf-mysql.services.clever-cloud.com'),
     port=int(os.getenv('MYSQL_PORT', 3306)),
-    user=os.getenv('MYSQL_USER', 'uhfemavaz7iyjcnh'),
-    password=os.getenv('MYSQL_PASSWORD', 'jVj84ZmtLAPJ50xJnMUJ'),
-    database=os.getenv('MYSQL_DB', 'bz4nf1aycs9arstd4y4l'),
+    user=os.getenv('MYSQL_USER', 'uihxwgphvyf5bhxa'),
+    password=os.getenv('MYSQL_PASSWORD', 'oCPY54FrSIHfMBHgVBrx'),
+    database=os.getenv('MYSQL_DB', 'bqebck7vtzt0e6ugzqsf'),
     charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor,
     autocommit=False,
@@ -347,10 +348,12 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
+# Production:
 # BASE_URL = "https://api.india.delta.exchange"
 # WS_URL = "wss://socket.india.delta.exchange"
+# Testnet (demo):
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-WS_URL ="wss://testnet-socket.india.delta.exchange"
+WS_URL = "wss://socket-ind.testnet.deltaex.org"
 
 fees=3.5
 
@@ -738,6 +741,15 @@ def init_database():
         except Exception:
             pass
 
+        # BE applied on this trade's position (info for signal/trade history UI)
+        try:
+            execute_mysql_query(
+                "ALTER TABLE closed_positions ADD COLUMN had_break_even TINYINT(1) DEFAULT 0",
+                commit=True
+            )
+        except Exception:
+            pass
+
         create_state_table_query = '''
             CREATE TABLE IF NOT EXISTS bot_state (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -885,7 +897,7 @@ def clear_bot_state_from_db():
 # "user ne UI se ON kiya tha aur abhi tak OFF nahi kiya" - aur khud-b-khud
 # usi symbol/settings ke saath dobara chalu ho jaye.
 # Sirf UI ke "Force Stop" / "Stop Bot" button se hi ye flag False hota hai.
-def save_session_active_flag(active: bool):
+def save_session_active_flag(active: bool, strategy_bot=None):
     try:
         session_data = {
             'active': active,
@@ -893,6 +905,7 @@ def save_session_active_flag(active: bool):
             'leverage': BOT_STATE.get('leverage'),
             'tp_percent': BOT_STATE.get('tp_percent'),
             'sl_percent': BOT_STATE.get('sl_percent'),
+            'strategy_bot': strategy_bot or bot_manager.get_active_bot_id() or 'bot1',
             'saved_at': datetime.now().isoformat()
         }
         upsert_query = '''
@@ -1216,6 +1229,12 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
             last_step = closest_step
             log_system(f"[PRE-ORDER VERIFY] No exact lot match for {lot_size} — closest step={last_step}")
 
+        if be_retry and pnl > 0:
+            log_system(
+                f"[PRE-ORDER VERIFY] BE SL retry suppressed — last trade PROFIT (TP), not BE SL"
+            )
+            be_retry = False
+
         if be_retry:
             next_step = last_step
             next_lot  = LOT_STEPS[next_step]
@@ -1467,573 +1486,14 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
     return result
 
 
-# ========== SIGNAL GENERATION — v7 (FULL INDICATOR SUITE) ==========
-
-import random
-from datetime import datetime
-
-
-def _ema(prices, period):
-    if len(prices) < period: return None
-    k = 2.0 / (period + 1)
-    val = sum(prices[:period]) / period
-    for p in prices[period:]: val = p * k + val * (1 - k)
-    return val
-
-def _sma(prices, period):
-    if len(prices) < period: return None
-    return sum(prices[-period:]) / period
-
-def _rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0)); losses.append(max(-d, 0))
-    ag = sum(gains) / period; al = sum(losses) / period
-    for i in range(period + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        ag = (ag * (period - 1) + max(d, 0)) / period
-        al = (al * (period - 1) + max(-d, 0)) / period
-    if al == 0: return 100.0
-    return 100 - (100 / (1 + ag / al))
-
-def _macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow + signal: return None, None, None
-    ef = _ema(closes, fast); es = _ema(closes, slow)
-    if ef is None or es is None: return None, None, None
-    ml = ef - es
-    series = []
-    for i in range(slow - 1, len(closes)):
-        ef2 = _ema(closes[:i+1], fast); es2 = _ema(closes[:i+1], slow)
-        if ef2 and es2: series.append(ef2 - es2)
-    if len(series) < signal: return ml, None, None
-    sl_ = _ema(series, signal)
-    return ml, sl_, (ml - sl_) if sl_ else None
-
-def _bollinger(closes, period=20, std_dev=2.0):
-    if len(closes) < period: return None, None, None
-    recent = closes[-period:]; mid = sum(recent) / period
-    std = (sum((x - mid) ** 2 for x in recent) / period) ** 0.5
-    return mid + std_dev * std, mid, mid - std_dev * std
-
-def _atr(candles, period=14):
-    if len(candles) < period + 1: return None
-    trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]['high']; l = candles[i]['low']; pc = candles[i-1]['close']
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    if len(trs) < period: return None
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]: atr = (atr * (period - 1) + tr) / period
-    return atr
-
-def _candle_strength(candles, lookback=5):
-    if len(candles) < lookback: return 0
-    recent = candles[-lookback:]
-    bull = sum(1 for c in recent if c['close'] > c['open'])
-    bear = sum(1 for c in recent if c['close'] < c['open'])
-    last = candles[-1]; rng = last['high'] - last['low']
-    body = abs(last['close'] - last['open'])
-    bp = (body / rng) if rng > 0 else 0
-    if bull >= 3 and bp > 0.5 and last['close'] > last['open']: return 1
-    if bear >= 3 and bp > 0.5 and last['close'] < last['open']: return -1
-    return 0
-
-def _wma(prices, period):
-    if len(prices) < period: return None
-    w = list(range(1, period + 1))
-    return sum(wi * p for wi, p in zip(w, prices[-period:])) / sum(w)
-
-def _hma(prices, period=9):
-    half = max(period // 2, 1); sq = max(int(period ** 0.5), 1)
-    if len(prices) < period: return None
-    raw = []
-    for i in range(max(period, half), len(prices) + 1):
-        wh = _wma(prices[:i], half); wf = _wma(prices[:i], period)
-        if wh and wf: raw.append(2 * wh - wf)
-    return _wma(raw, sq) if len(raw) >= sq else None
-
-def _ultimate_oscillator(candles, p1=7, p2=14, p3=28):
-    if len(candles) < p3 + 1: return None
-    def _avg(sl):
-        bps, trs = [], []
-        for i in range(1, len(sl)):
-            pc = sl[i-1]['close']; h = sl[i]['high']; l = sl[i]['low']; c = sl[i]['close']
-            bps.append(c - min(l, pc)); trs.append(max(h, pc) - min(l, pc))
-        return sum(bps)/sum(trs) if sum(trs) else 0
-    return 100 * (4*_avg(candles[-(p1+1):]) + 2*_avg(candles[-(p2+1):]) + _avg(candles[-(p3+1):])) / 7
-
-def _adx(candles, period=14):
-    if len(candles) < period * 2 + 1: return None, None, None
-    trs, pdms, mdms = [], [], []
-    for i in range(1, len(candles)):
-        h=candles[i]['high']; l=candles[i]['low']; ph=candles[i-1]['high']
-        pl=candles[i-1]['low']; pc=candles[i-1]['close']
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-        pdms.append(max(h-ph, 0) if (h-ph) > (pl-l) else 0)
-        mdms.append(max(pl-l, 0) if (pl-l) > (h-ph) else 0)
-    def _sm(v, p):
-        s = sum(v[:p]); r = [s]
-        for x in v[p:]: s = s - s/p + x; r.append(s)
-        return r
-    st=_sm(trs,period); sp=_sm(pdms,period); sm=_sm(mdms,period)
-    if not st or st[-1]==0: return None, None, None
-    pdi=100*sp[-1]/st[-1]; mdi=100*sm[-1]/st[-1]
-    dx = [100*abs(100*p/t - 100*m/t)/(100*p/t + 100*m/t)
-          for p,m,t in zip(sp,sm,st) if t and (100*p/t + 100*m/t)]
-    return (sum(dx[-period:])/period if len(dx)>=period else None), pdi, mdi
-
-def _bull_bear_power(candles, period=13):
-    if len(candles) < period: return None, None
-    ev = _ema([c['close'] for c in candles], period)
-    if ev is None: return None, None
-    return candles[-1]['high'] - ev, candles[-1]['low'] - ev
-
-def _momentum(closes, period=20):
-    if len(closes) < period + 1: return None
-    return closes[-1] - closes[-(period+1)]
-
-def _ppo(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow + signal: return None, None, None
-    ef=_ema(closes,fast); es=_ema(closes,slow)
-    if not ef or not es or es==0: return None, None, None
-    ppo = ((ef-es)/es)*100
-    series = [((ef2-es2)/es2)*100 for i in range(slow-1, len(closes))
-              for ef2,es2 in [(_ema(closes[:i+1],fast), _ema(closes[:i+1],slow))]
-              if ef2 and es2 and es2!=0]
-    if len(series) < signal: return ppo, None, None
-    sig = _ema(series, signal)
-    return ppo, sig, (ppo-sig) if sig else None
-
-def _stoch_rsi(closes, period=14, sk=3, sd=3):
-    if len(closes) < period*2+sk+sd: return None, None
-    rs = [_rsi(closes[:i], period) for i in range(period, len(closes)+1)]
-    if len(rs) < period: return None, None
-    st = []
-    for i in range(period-1, len(rs)):
-        w=rs[i-period+1:i+1]; mn=min(w); mx=max(w)
-        st.append(((rs[i]-mn)/(mx-mn)*100) if (mx-mn) else 50.0)
-    if len(st) < sk+sd: return None, None
-    ks = [sum(st[i-sk+1:i+1])/sk for i in range(sk-1, len(st))]
-    return (ks[-1], sum(ks[-sd:])/sd) if len(ks)>=sd else (None, None)
-
-def _ichimoku(candles, t=9, k=26, sb=52):
-    if len(candles) < sb: return None
-    def _m(sl): return (max(c['high'] for c in sl)+min(c['low'] for c in sl))/2
-    tn=_m(candles[-t:]); kj=_m(candles[-k:])
-    return {'tenkan':tn,'kijun':kj,'senkou_a':(tn+kj)/2,'senkou_b':_m(candles[-sb:]),
-            'chikou':candles[-1]['close'],
-            'price_ago':candles[-k]['close'] if len(candles)>=k else None}
-
-def _cci(candles, period=20):
-    if len(candles) < period: return None
-    rc=candles[-period:]; tp=[(c['high']+c['low']+c['close'])/3 for c in rc]
-    sma=sum(tp)/period; md=sum(abs(t-sma) for t in tp)/period
-    return 0 if md==0 else (tp[-1]-sma)/(0.015*md)
-
-def _awesome_oscillator(candles, fast=5, slow=34):
-    if len(candles) < slow: return None
-    mids=[(c['high']+c['low'])/2 for c in candles]
-    sf=_sma(mids,fast); ss=_sma(mids,slow)
-    return (sf-ss) if (sf and ss) else None
-
-def _williams_r(candles, period=14):
-    if len(candles) < period: return None
-    rc=candles[-period:]; hh=max(c['high'] for c in rc); ll=min(c['low'] for c in rc)
-    close=candles[-1]['close']
-    return -50.0 if hh==ll else ((hh-close)/(hh-ll))*-100
-
-def _ma_suite_score(closes, label=""):
-    sb, ss, det = 0, 0, []
-    price = closes[-1]
-    for p in [5, 10, 20, 50, 100, 200]:
-        for fn, nm in [(_sma, 'SMA'), (_ema, 'EMA')]:
-            v = fn(closes, p)
-            if v:
-                if price > v: sb+=1; det.append(f"[{label}] Price>{nm}{p} → BUY +1")
-                else:         ss+=1; det.append(f"[{label}] Price<{nm}{p} → SELL +1")
-    return sb, ss, det
-
-
-def _score_timeframe(candles, label=""):
-    if len(candles) < 30:
-        return {'bias':'NEUTRAL','score':0,'details':[],'score_buy':0,'score_sell':0,'net':0,
-                'rsi':50,'ema9':None,'ema21':None,'ema50':None,'adx':None,'cci':None,
-                'ao':None,'williams_r':None,'uo':None,'ppo':None,'stoch_k':None,'hma':None}
-
-    closes=[c['close'] for c in candles]; sb=0; ss=0; det=[]
-
-    e9=_ema(closes,9); e21=_ema(closes,21)
-    if e9 and e21:
-        if e9>e21: sb+=2; det.append(f"[{label}] EMA9>EMA21 → BUY +2")
-        else:      ss+=2; det.append(f"[{label}] EMA9<EMA21 → SELL +2")
-
-    e50=_ema(closes,50) if len(closes)>=50 else None
-    if e21 and e50:
-        if e21>e50: sb+=1; det.append(f"[{label}] EMA21>EMA50 → BUY +1")
-        else:       ss+=1; det.append(f"[{label}] EMA21<EMA50 → SELL +1")
-
-    rsi=_rsi(closes,14)
-    if   rsi<30: sb+=3; det.append(f"[{label}] RSI={rsi:.1f} OVERSOLD → BUY +3")
-    elif rsi>70: ss+=3; det.append(f"[{label}] RSI={rsi:.1f} OVERBOUGHT → SELL +3")
-    elif rsi<45: sb+=1; det.append(f"[{label}] RSI={rsi:.1f} <45 → BUY +1")
-    elif rsi>55: ss+=1; det.append(f"[{label}] RSI={rsi:.1f} >55 → SELL +1")
-
-    ml,sl_,hist=_macd(closes)
-    if hist is not None and ml and sl_:
-        thr=abs(closes[-1])*0.00005
-        if   abs(hist)>thr and hist>0 and ml>sl_: sb+=3; det.append(f"[{label}] MACD strong BUY → +3")
-        elif abs(hist)>thr and hist<0 and ml<sl_: ss+=3; det.append(f"[{label}] MACD strong SELL → +3")
-        elif ml>sl_: sb+=1; det.append(f"[{label}] MACD>signal → BUY +1")
-        elif ml<sl_: ss+=1; det.append(f"[{label}] MACD<signal → SELL +1")
-
-    bbu,_,bbl=_bollinger(closes)
-    if bbu and bbl:
-        rng=bbu-bbl
-        if rng>0:
-            pos=(closes[-1]-bbl)/rng
-            if   pos<0.15: sb+=2; det.append(f"[{label}] BB lower extreme → BUY +2")
-            elif pos>0.85: ss+=2; det.append(f"[{label}] BB upper extreme → SELL +2")
-
-    cs=_candle_strength(candles,5)
-    if cs==1:  sb+=1; det.append(f"[{label}] Bullish candles → BUY +1")
-    elif cs==-1:ss+=1; det.append(f"[{label}] Bearish candles → SELL +1")
-
-    hma=_hma(closes,9)
-    if hma:
-        if closes[-1]>hma: sb+=1; det.append(f"[{label}] Price>HMA9 → BUY +1")
-        else:               ss+=1; det.append(f"[{label}] Price<HMA9 → SELL +1")
-
-    uo=_ultimate_oscillator(candles,7,14,28)
-    if uo:
-        if   uo<30: sb+=2; det.append(f"[{label}] UO={uo:.1f} OVERSOLD → BUY +2")
-        elif uo>70: ss+=2; det.append(f"[{label}] UO={uo:.1f} OVERBOUGHT → SELL +2")
-        elif uo>50: sb+=1; det.append(f"[{label}] UO={uo:.1f} >50 → BUY +1")
-        else:       ss+=1; det.append(f"[{label}] UO={uo:.1f} <50 → SELL +1")
-
-    adx,pdi,mdi=_adx(candles,14)
-    if adx and pdi and mdi and adx>25:
-        if pdi>mdi: sb+=2; det.append(f"[{label}] ADX={adx:.1f} DI+ → BUY +2")
-        else:       ss+=2; det.append(f"[{label}] ADX={adx:.1f} DI- → SELL +2")
-
-    bp,brp=_bull_bear_power(candles,13)
-    if bp is not None and brp is not None:
-        if   bp>0 and brp>0: sb+=2; det.append(f"[{label}] Both powers>0 → BUY +2")
-        elif bp<0 and brp<0: ss+=2; det.append(f"[{label}] Both powers<0 → SELL +2")
-        elif bp>0:            sb+=1; det.append(f"[{label}] Bull power>0 → BUY +1")
-        elif brp<0:           ss+=1; det.append(f"[{label}] Bear power<0 → SELL +1")
-
-    mom=_momentum(closes,20)
-    if mom is not None:
-        if mom>0: sb+=1; det.append(f"[{label}] Momentum+ → BUY +1")
-        else:     ss+=1; det.append(f"[{label}] Momentum- → SELL +1")
-
-    ppo,psig,phist=_ppo(closes,12,26,9)
-    if ppo is not None:
-        if ppo>0:   sb+=1; det.append(f"[{label}] PPO>0 → BUY +1")
-        else:       ss+=1; det.append(f"[{label}] PPO<0 → SELL +1")
-        if phist:
-            if phist>0: sb+=1; det.append(f"[{label}] PPO hist+ → BUY +1")
-            else:       ss+=1; det.append(f"[{label}] PPO hist- → SELL +1")
-
-    sk_v,sd_v=_stoch_rsi(closes,14)
-    if sk_v is not None:
-        if   sk_v<20: sb+=2; det.append(f"[{label}] StochRSI OVERSOLD → BUY +2")
-        elif sk_v>80: ss+=2; det.append(f"[{label}] StochRSI OVERBOUGHT → SELL +2")
-        elif sd_v and sk_v>sd_v: sb+=1; det.append(f"[{label}] StochRSI K>D → BUY +1")
-        elif sd_v and sk_v<sd_v: ss+=1; det.append(f"[{label}] StochRSI K<D → SELL +1")
-
-    ichi=_ichimoku(candles,9,26,52)
-    if ichi:
-        price=closes[-1]; ct=max(ichi['senkou_a'],ichi['senkou_b']); cb=min(ichi['senkou_a'],ichi['senkou_b'])
-        if   price>ct: sb+=2; det.append(f"[{label}] Ichimoku above cloud → BUY +2")
-        elif price<cb: ss+=2; det.append(f"[{label}] Ichimoku below cloud → SELL +2")
-        if ichi['tenkan']>ichi['kijun']: sb+=1; det.append(f"[{label}] Tenkan>Kijun → BUY +1")
-        else:                             ss+=1; det.append(f"[{label}] Tenkan<Kijun → SELL +1")
-        if ichi['price_ago']:
-            if ichi['chikou']>ichi['price_ago']: sb+=1; det.append(f"[{label}] Chikou above → BUY +1")
-            else:                                 ss+=1; det.append(f"[{label}] Chikou below → SELL +1")
-
-    cci=_cci(candles,20)
-    if cci is not None:
-        if   cci<-100: sb+=2; det.append(f"[{label}] CCI OVERSOLD → BUY +2")
-        elif cci>100:  ss+=2; det.append(f"[{label}] CCI OVERBOUGHT → SELL +2")
-        elif cci>0:    sb+=1; det.append(f"[{label}] CCI>0 → BUY +1")
-        else:          ss+=1; det.append(f"[{label}] CCI<0 → SELL +1")
-
-    ao=_awesome_oscillator(candles,5,34)
-    if ao is not None:
-        if ao>0: sb+=1; det.append(f"[{label}] AO>0 → BUY +1")
-        else:    ss+=1; det.append(f"[{label}] AO<0 → SELL +1")
-
-    wr=_williams_r(candles,14)
-    if wr is not None:
-        if   wr<-80: sb+=2; det.append(f"[{label}] W%R OVERSOLD → BUY +2")
-        elif wr>-20: ss+=2; det.append(f"[{label}] W%R OVERBOUGHT → SELL +2")
-        elif wr<-50: ss+=1; det.append(f"[{label}] W%R bearish → SELL +1")
-        else:        sb+=1; det.append(f"[{label}] W%R bullish → BUY +1")
-
-    mb,ms,md=_ma_suite_score(closes,label)
-    sb+=mb; ss+=ms; det+=md
-
-    net=sb-ss
-    if   net>0: bias,score='BUY',sb
-    elif net<0: bias,score='SELL',ss
-    else:       bias,score='NEUTRAL',0
-
-    return {'bias':bias,'score':score,'score_buy':sb,'score_sell':ss,'net':net,
-            'rsi':rsi,'ema9':e9,'ema21':e21,'ema50':e50,'details':det,
-            'adx':adx,'cci':cci,'ao':ao,'williams_r':wr,'uo':uo,'ppo':ppo,'stoch_k':sk_v,'hma':hma}
-
-
-# >>> ADDED: formats one timeframe's result into a compact display string
-# e.g. "BUY (18/15/+3)". INFO ONLY — used only for saving/showing scores,
-# never used in any decision-making.
-def _format_tf_result(r):
-    if not r:
-        return "NEUTRAL (0/0/+0)"
-    return f"{r.get('bias','NEUTRAL')} ({r.get('score_buy',0)}/{r.get('score_sell',0)}/{r.get('net',0):+d})"
-
-
-def _fetch_candles(symbol, resolution, num_candles):
-    try:
-        # >>> ADDED: '2h' and '1w' keys added below (info-only timeframes), nothing else changed
-        sec={'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'1d':86400,'1w':604800}.get(resolution,300)
-        end=int(_time.time()); start=end-(num_candles*sec)
-        resp=make_api_request('GET',f'/history/candles?resolution={resolution}&symbol={symbol}&start={start}&end={end}')
-        if not resp or not resp.get('result'): print(f"⚠️ No candles {symbol}@{resolution}"); return []
-        parsed=[{'open':float(c.get('open',0)),'high':float(c.get('high',0)),
-                 'low':float(c.get('low',0)),'close':float(c.get('close',0)),'time':c.get('time',0)}
-                for c in resp['result'] if c]
-        parsed.sort(key=lambda x:x['time'])
-        print(f"📊 {symbol} @ {resolution}: {len(parsed)} candles fetched")
-        return parsed
-    except Exception as e:
-        print(f"❌ Error {resolution}: {e}"); return []
-
-def _is_market_tradeable(candles_15m):
-    if len(candles_15m) < 15: return True
-    atr_val=_atr(candles_15m,14); price=candles_15m[-1]['close']
-    if not atr_val or price<=0: return True
-    pct=(atr_val/price)*100
-    if pct<0.02: print(f"⚠️ Too flat ATR={pct:.4f}%"); return False
-    print(f"✅ ATR OK: {pct:.4f}%"); return True
-
-
-def _print_extra_timeframe_scores(symbol):
-    """
-    INFO ONLY — extra timeframe scores for display (1M, 5M, 30M, 2H, 1D, 1W).
-    This function does NOT make any trading decision and does NOT affect
-    the strategy/entry logic in generate_smart_signal() in any way.
-    Returns a dict {label: result_dict} so callers can also SAVE this data
-    (e.g. to DB) without changing what gets printed.
-    """
-    tf_map = [
-        ('1m',  '1M'),
-        ('5m',  '5M'),
-        ('30m', '30M'),
-        ('2h',  '2H'),
-        ('1d',  '1D'),
-        ('1w',  '1W'),
-    ]
-    print(f"\n📊 EXTRA TIMEFRAME SCORES (INFO ONLY):")
-    extra_results = {}
-    for res, label in tf_map:
-        try:
-            candles = _fetch_candles(symbol, res, 120)
-            if len(candles) < 20:
-                print(f"   {label:4s} → NEUTRAL | Not enough candles")
-                extra_results[label] = {'bias': 'NEUTRAL', 'score_buy': 0, 'score_sell': 0, 'net': 0}
-                continue
-            r = _score_timeframe(candles, label)
-            print(f"   {label:4s} → {r['bias']:7s} | BUY={r['score_buy']:2d} SELL={r['score_sell']:2d} Net={r['net']:+3d}")
-            extra_results[label] = r
-        except Exception as e:
-            print(f"   {label:4s} → ERROR: {e}")
-            extra_results[label] = {'bias': 'NEUTRAL', 'score_buy': 0, 'score_sell': 0, 'net': 0}
-    return extra_results
-
+# ========== SIGNAL / STRATEGY BOTS ==========
+# Decision logic lives in bot1.py / bot2.py / bot3.py / bot4.py
+# Only the bot selected in the UI is loaded into RAM (see bot_manager.py).
 
 def generate_smart_signal(reason="trade_decision"):
-    """
-    SIGNAL ENGINE v7
+    """Delegate to the active strategy bot (lazy-loaded)."""
+    return bot_manager.generate_smart_signal(reason=reason)
 
-    RULES:
-    ┌─────────────────────────────────────────────────┐
-    │  4H = MASTER DIRECTION                          │
-    │  15M must agree with 4H + net >= 4              │
-    │  1H = confidence only (not a blocker)           │
-    │                                                 │
-    │  4H SELL + 15M SELL + net>=4  →  SELL ✅        │
-    │  4H BUY  + 15M BUY  + net>=4  →  BUY  ✅        │
-    │  4H SELL + 15M BUY            →  WAIT ⏳        │
-    │  4H BUY  + 15M SELL           →  WAIT ⏳        │
-    │  4H NEUTRAL: need 1H+15M agree + net>=5         │
-    └─────────────────────────────────────────────────┘
-    """
-
-    symbol = BOT_STATE.get('symbol', 'ETHUSD')
-    print(f"\n{'='*60}")
-    print(f"🧠 SIGNAL ENGINE v7 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
-    print(f"{'='*60}")
-
-    candles_4h  = _fetch_candles(symbol, '4h',  120)
-    candles_1h  = _fetch_candles(symbol, '1h',  120)
-    candles_15m = _fetch_candles(symbol, '15m', 120)
-
-    if len(candles_4h) < 20:  candles_4h = None
-    if len(candles_1h) < 20 or len(candles_15m) < 20:
-        d = random.choice(['BUY','SELL'])
-        return _make_signal(d, 50, 'RANDOM_FALLBACK', 0, reason, {}, {}, {}, candles_15m or [])
-
-    if not _is_market_tradeable(candles_15m):
-        return _make_wait_signal(reason, "Market too flat")
-
-    r4h  = _score_timeframe(candles_4h,  '4H') if candles_4h else None
-    r1h  = _score_timeframe(candles_1h,  '1H')
-    r15m = _score_timeframe(candles_15m, '15M')
-
-    b4h  = r4h['bias']  if r4h  else 'NEUTRAL'
-    b1h  = r1h['bias']
-    b15m = r15m['bias']
-
-    print(f"\n📊 SCORES:")
-    if r4h:
-        print(f"   4H  → {b4h:7s} | BUY={r4h['score_buy']:2d} SELL={r4h['score_sell']:2d} Net={r4h['net']:+3d}  ← MASTER")
-    print(f"   1H  → {b1h:7s} | BUY={r1h['score_buy']:2d} SELL={r1h['score_sell']:2d} Net={r1h['net']:+3d}  (confidence only)")
-    print(f"   15M → {b15m:7s} | BUY={r15m['score_buy']:2d} SELL={r15m['score_sell']:2d} Net={r15m['net']:+3d}  ← ENTRY")
-    
-
-    # >>> ADDED: single call, info-only — prints extra timeframe scores (1m,5m,30m,2h,1d,1w)
-    # AND captures them so we can save a full score snapshot to DB later.
-    # Does not change any variable used below in the decision logic.
-    extra_scores = _print_extra_timeframe_scores(symbol)
-
-    # >>> ADDED: build formatted timeframe_scores dict — INFO ONLY, purely for
-    # saving/display. Not used anywhere in the decision logic below.
-    timeframe_scores = {
-        '1m':  _format_tf_result(extra_scores.get('1M')),
-        '5m':  _format_tf_result(extra_scores.get('5M')),
-        '15m': _format_tf_result(r15m),
-        '30m': _format_tf_result(extra_scores.get('30M')),
-        '1h':  _format_tf_result(r1h),
-        '2h':  _format_tf_result(extra_scores.get('2H')),
-        '4h':  _format_tf_result(r4h),
-        '1d':  _format_tf_result(extra_scores.get('1D')),
-        '1w':  _format_tf_result(extra_scores.get('1W')),
-    }
-
-    # Final decision uses ONLY user-selected timeframes (Decision Timeframes card).
-    # Scoring / snapshot above stays unchanged. Bot loop / place_order untouched.
-    score_map = {
-        '1m':  extra_scores.get('1M'),
-        '5m':  extra_scores.get('5M'),
-        '15m': r15m,
-        '30m': extra_scores.get('30M'),
-        '1h':  r1h,
-        '2h':  extra_scores.get('2H'),
-        '4h':  r4h,
-        '1d':  extra_scores.get('1D'),
-    }
-    direction, wait_resp = _resolve_signal_from_selected_tfs(score_map, timeframe_scores, reason)
-    if wait_resp is not None:
-        return wait_resp
-
-    MAX_SCORE = 75.0
-    w_4h = 0.35 if r4h else 0.0
-    w_1h = 0.30
-    w_15 = 0.35
-
-    score_4h = r4h['score'] if r4h else 0
-    conf_raw = (score_4h * w_4h + r1h['score'] * w_1h + r15m['score'] * w_15) / MAX_SCORE
-
-    if b1h == direction:
-        conf_raw = min(conf_raw * 1.15, 1.0)
-        print(f"   ✅ 1H also agrees ({b1h}) — confidence boosted")
-    else:
-        conf_raw = conf_raw * 0.90
-        print(f"   ⚠️ 1H disagrees ({b1h}) — slight confidence reduction")
-
-    confidence = int(min(50 + conf_raw * 50, 95))
-
-    net15 = abs(r15m['net'])
-    if   net15 >= 15: layer = 'STRONG_BUY'   if direction=='BUY' else 'STRONG_SELL'
-    elif net15 >= 8:  layer = 'MODERATE_BUY' if direction=='BUY' else 'MODERATE_SELL'
-    else:             layer = 'WEAK_BUY'      if direction=='BUY' else 'WEAK_SELL'
-
-    print(f"   Confidence={confidence}%  Layer={layer}")
-    # # Reverse final signal
-    # if direction == "BUY":
-    #     direction = "SELL"
-    # elif direction == "SELL":
-    #     direction = "BUY"
-
-    return _make_signal(direction, confidence, layer,
-                        r15m['net'], reason, r4h or {}, r1h, r15m, candles_15m,
-                        timeframe_scores=timeframe_scores)
-
-
-def _make_signal(direction, confidence, layer, net_score, reason,
-                 r4h, r1h, r15m, candles_15m, timeframe_scores=None):
-    price=candles_15m[-1]['close'] if candles_15m else 0
-    atr_val=_atr(candles_15m,14) if candles_15m else None
-    if atr_val and price:
-        ref_sl=round(price-(1.5*atr_val),4) if direction=='BUY' else round(price+(1.5*atr_val),4)
-        ref_tp=round(price+(3.0*atr_val),4) if direction=='BUY' else round(price-(3.0*atr_val),4)
-    else: ref_sl=ref_tp=None
-    print(f"   📍 Entry={price} SL={ref_sl} TP={ref_tp}")
-
-    dec_parts = []
-    if r4h:
-        dec_parts.append(f"4H: {r4h.get('bias','NEUTRAL')} (B={r4h.get('score_buy',0)},S={r4h.get('score_sell',0)},N={r4h.get('net',0):+d})")
-    else:
-        dec_parts.append("4H: NEUTRAL (B=0,S=0,N=0)")
-        
-    if r1h:
-        dec_parts.append(f"1H: {r1h.get('bias','NEUTRAL')} (B={r1h.get('score_buy',0)},S={r1h.get('score_sell',0)},N={r1h.get('net',0):+d})")
-    else:
-        dec_parts.append("1H: NEUTRAL (B=0,S=0,N=0)")
-        
-    if r15m:
-        dec_parts.append(f"15M: {r15m.get('bias','NEUTRAL')} (B={r15m.get('score_buy',0)},S={r15m.get('score_sell',0)},N={r15m.get('net',0):+d})")
-    else:
-        dec_parts.append("15M: NEUTRAL (B=0,S=0,N=0)")
-        
-    trade_decisions_str = " | ".join(dec_parts)
-
-    return {
-        'signal':direction,'timestamp':datetime.now().isoformat(),
-        'confidence':confidence,'layer':layer,'score':net_score,
-        'score_buy':r15m.get('score_buy',0),'score_sell':r15m.get('score_sell',0),
-        'source':'smart_signal_v7','entry_price':price,'ref_sl':ref_sl,'ref_tp':ref_tp,
-        'reason':f"4H={r4h.get('bias','?')} 1H={r1h.get('bias','?')} 15M={r15m.get('bias','?')} Net={net_score}",
-        'trade_decisions': trade_decisions_str,
-        'decision_ready':True,'decision_confidence':confidence/100,'wait':False,
-        'position_analysis':{'has_position':False},
-        'backtest_results':{
-            'ema9':r15m.get('ema9'),'ema21':r15m.get('ema21'),'ema50':r15m.get('ema50'),
-            'rsi':r15m.get('rsi'),'adx':r15m.get('adx'),'cci':r15m.get('cci'),
-            'ao':r15m.get('ao'),'williams_r':r15m.get('williams_r'),'uo':r15m.get('uo'),
-            'ppo':r15m.get('ppo'),'stoch_k':r15m.get('stoch_k'),'hma':r15m.get('hma'),
-            'price':price,'ref_sl':ref_sl,'ref_tp':ref_tp,'factors':r15m.get('details',[]),
-            '4h_bias':r4h.get('bias','?'),'1h_bias':r1h.get('bias','?'),'15m_bias':r15m.get('bias','?'),
-        },
-        'timeframe_scores': timeframe_scores or {},   # >>> ADDED: info only
-        'last_trade_result':reason,
-    }
-
-def _make_wait_signal(reason, why, timeframe_scores=None):
-    print(f"⏸️ WAIT: {why}")
-    return {
-        'signal':'WAIT','timestamp':datetime.now().isoformat(),
-        'confidence':0,'layer':'WAIT','score':0,'score_buy':0,'score_sell':0,
-        'source':'smart_signal_v7','reason':why,'entry_price':None,'ref_sl':None,'ref_tp':None,
-        'decision_ready':False,'decision_confidence':0,'wait':True,
-        'position_analysis':{'has_position':False},'backtest_results':{},
-        'timeframe_scores': timeframe_scores or {},   # >>> ADDED: info only
-        'last_trade_result':reason,
-    }
 
 def save_closed_position(trade_data):
     global LAST_SAVED_TRADE_KEY
@@ -2096,11 +1556,17 @@ def save_closed_position(trade_data):
             # >>> ADDED: exit_order_id captured alongside entry_order_id
             exit_order_id = trade_data.get('exit_order_id')
 
+            # BE flag: explicit on trade_data, else consume in-memory mark from guardian
+            had_be = bool(trade_data.get('had_break_even'))
+            if not had_be and entry_order_id:
+                had_be = _consume_order_had_be(str(entry_order_id))
+
             insert_query = '''
                 INSERT INTO closed_positions
                 (symbol, side, entry_price, exit_price, quantity, pnl,
-                 entry_time, exit_time, is_latest, entry_order_id, exit_order_id, trade_decisions)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s)
+                 entry_time, exit_time, is_latest, entry_order_id, exit_order_id,
+                 trade_decisions, had_break_even)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s)
             '''
             inserted_id = execute_mysql_query(
                 insert_query,
@@ -2115,7 +1581,8 @@ def save_closed_position(trade_data):
                     trade_data['exit_time'],
                     str(entry_order_id) if entry_order_id else None,
                     str(exit_order_id) if exit_order_id else None,
-                    trade_decisions
+                    trade_decisions,
+                    1 if had_be else 0,
                 ),
                 commit=True
             )
@@ -2869,13 +2336,21 @@ def auto_trading_bot_main():
                     # this order. INFO ONLY — runs AFTER order is already placed,
                     # cannot affect the order or the decision that led to it.
                     try:
+                        # Signal Scores History = bot's original decision only.
+                        # Reverse (if On) flips the live order side, not this snapshot.
+                        original_decision = (
+                            signal_data.get('original_signal')
+                            or signal_data.get('signal')
+                            or side.upper()
+                        )
+                        original_decision = str(original_decision).upper()
                         save_signal_score_history(
                             order_id=placed_order_id,
                             symbol=BOT_STATE['symbol'],
-                            position=side.upper(),
+                            position=original_decision,
                             lot_size=next_lot,
                             timeframe_scores=signal_data.get('timeframe_scores', {}),
-                            final_decision=signal_data.get('signal', side.upper()),
+                            final_decision=original_decision,
                             entry_time=datetime.now().isoformat()
                         )
                     except Exception as e:
@@ -2938,6 +2413,7 @@ def auto_trading_bot_main():
     # but here we intentionally clear it any time the loop exits normally,
     # since that means running=False was set (by force-stop or the UI).
     save_session_active_flag(False)
+    bot_manager.deactivate_bot()  # unload strategy module when engine stops
     print("🤖 Auto Trading Bot Stopped")
  
 
@@ -3455,7 +2931,12 @@ def check_position_and_detect_closure():
                         BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                         BOT_STATE['last_pnl']    = pnl
 
-                        _handle_close_step_progression(symbol, pnl)
+                        _handle_close_step_progression(
+                            symbol, pnl,
+                            exit_price=entry_exit_data.get('exit_price'),
+                            entry_price=entry_exit_data.get('entry_price'),
+                            side=entry_exit_data.get('side'),
+                        )
                         save_bot_state_to_db()
                         log_state(f"STATE SAVED FOR ORDER: {completed_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3548,7 +3029,12 @@ def check_position_and_detect_closure():
                     BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                     BOT_STATE['last_pnl']    = pnl
 
-                    _handle_close_step_progression(symbol, pnl)
+                    _handle_close_step_progression(
+                        symbol, pnl,
+                        exit_price=entry_exit_data.get('exit_price'),
+                        entry_price=entry_exit_data.get('entry_price'),
+                        side=entry_exit_data.get('side'),
+                    )
                     save_bot_state_to_db()
                     log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3670,7 +3156,12 @@ def check_position_and_detect_closure():
                 BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                 BOT_STATE['last_pnl']    = pnl
 
-                _handle_close_step_progression(symbol, pnl)
+                _handle_close_step_progression(
+                    symbol, pnl,
+                    exit_price=entry_exit_data.get('exit_price'),
+                    entry_price=entry_exit_data.get('entry_price'),
+                    side=entry_exit_data.get('side'),
+                )
                 save_bot_state_to_db()
                 log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3764,7 +3255,12 @@ def check_position_and_detect_closure():
                 BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                 BOT_STATE['last_pnl']    = pnl
 
-                _handle_close_step_progression(symbol, pnl)
+                _handle_close_step_progression(
+                    symbol, pnl,
+                    exit_price=entry_exit_data.get('exit_price'),
+                    entry_price=entry_exit_data.get('entry_price'),
+                    side=entry_exit_data.get('side'),
+                )
                 save_bot_state_to_db()
                 log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
@@ -3823,11 +3319,23 @@ def get_trading_signal():
     global CURRENT_SIGNAL
     try:
         CURRENT_SIGNAL = generate_smart_signal(reason="trade_decision")
-        signal = CURRENT_SIGNAL.get('signal', '')
+        signal = (CURRENT_SIGNAL.get('signal') or '').upper()
+        # Keep bot's original decision for Signal Scores History (never reverse there).
+        CURRENT_SIGNAL['original_signal'] = signal
 
-        if signal.upper() == "BUY":
+        # Guardian UI toggle — applies AFTER any bot script, so Bot 1/2/3/4 all work.
+        if get_guardian_config().get('reverse_decision') and signal in ('BUY', 'SELL'):
+            flipped = 'SELL' if signal == 'BUY' else 'BUY'
+            CURRENT_SIGNAL['signal'] = flipped
+            CURRENT_SIGNAL['decision_reversed'] = True
+            print(f"🔄 REVERSE DECISION ON | bot={signal} → trade={flipped}")
+            signal = flipped
+        else:
+            CURRENT_SIGNAL['decision_reversed'] = False
+
+        if signal == "BUY":
             return 'buy', CURRENT_SIGNAL
-        elif signal.upper() == "SELL":
+        elif signal == "SELL":
             return 'sell', CURRENT_SIGNAL
         else:
             print(f"⏳ Signal WAIT — sleeping before retry...")
@@ -4190,6 +3698,19 @@ def get_system_resources():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
+@app.route('/api/bots', methods=['GET'])
+def api_list_bots():
+    """List strategy bots for UI — does not load strategy modules into RAM."""
+    try:
+        return jsonify({
+            'success': True,
+            'bots': bot_manager.list_bots(),
+            'active_bot': bot_manager.get_active_bot_id(),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
 @app.route('/api/start-bot', methods=['POST'])
 def start_bot():
     try:
@@ -4201,6 +3722,14 @@ def start_bot():
         tp_percent = data.get('tp_percent', 2.0)
         sl_percent = data.get('sl_percent', 1.0)
         symbol     = data.get('symbol', 'ADAUSD')
+        strategy_bot = str(data.get('strategy_bot') or data.get('bot_id') or 'bot1').strip().lower()
+
+        # Load ONLY the chosen strategy file into RAM (others stay unloaded)
+        ok_bot, bot_msg, bot_meta = bot_manager.activate_bot(strategy_bot)
+        if not ok_bot:
+            return jsonify({'success': False, 'message': bot_msg}), 400
+        log_system(f"STRATEGY BOT ACTIVATED | {bot_msg}")
+
         # Optional: allow start lot / streak on start; otherwise use saved LOT_STEPS
         if data.get('start_lot') is not None or data.get('streak') is not None:
             start_lot = data.get('start_lot', LOT_STEPS_META['start_lot'])
@@ -4258,15 +3787,20 @@ def start_bot():
             BOT_STATE['current_step'] = 1
             BOT_STATE['current_lot']  = LOT_STEPS[1]
 
-        log_system(f"BOT STARTING: Step={BOT_STATE['current_step']}, Lot={BOT_STATE['current_lot']}, TP={BOT_STATE['tp_percent']}%, SL={BOT_STATE['sl_percent']}%")
+        log_system(
+            f"BOT STARTING: strategy={strategy_bot}, Step={BOT_STATE['current_step']}, "
+            f"Lot={BOT_STATE['current_lot']}, TP={BOT_STATE['tp_percent']}%, SL={BOT_STATE['sl_percent']}%"
+        )
 
         if start_auto_trading_bot():
             return jsonify({
                 'success': True,
-                'message': 'Bot started successfully',
+                'message': f"Bot started successfully ({bot_meta.get('name', strategy_bot)})",
                 'current_step': BOT_STATE['current_step'],
                 'current_lot': BOT_STATE['current_lot'],
-                'has_existing_position': has_existing_position
+                'has_existing_position': has_existing_position,
+                'strategy_bot': strategy_bot,
+                'strategy_name': bot_meta.get('name') if bot_meta else strategy_bot,
             })
         return jsonify({'success': False, 'message': 'Bot already running'})
 
@@ -4345,6 +3879,8 @@ def update_symbol():
 def stop_bot():
     try:
         if stop_auto_trading_bot():
+            bot_manager.deactivate_bot()  # unload strategy — free RAM
+            log_system("STRATEGY BOT UNLOADED")
             return jsonify({'success': True, 'message': 'Bot stopped successfully'})
         return jsonify({'success': False, 'message': 'Bot was not running'})
     except Exception as e:
@@ -4444,7 +3980,8 @@ def get_bot_status():
                 'cooldown_remaining_seconds': round(cooldown_remaining, 1),
                 'cooldown_seconds': COOLDOWN_SECONDS,
                 'order_completed': BOT_STATE['order_completed'],
-                'last_placed_order_id': BOT_STATE.get('last_placed_order_id')
+                'last_placed_order_id': BOT_STATE.get('last_placed_order_id'),
+                'strategy_bot': bot_manager.get_active_bot_id(),
             }
         })
     except Exception as e:
@@ -4498,7 +4035,7 @@ def trade_history():
         query = '''
             SELECT id, symbol, side, entry_price, exit_price, quantity,
                    pnl, entry_time, exit_time, trade_decisions,
-                   entry_order_id, exit_order_id
+                   entry_order_id, exit_order_id, had_break_even
             FROM closed_positions
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
@@ -4518,6 +4055,7 @@ def trade_history():
                 'trade_decisions': t.get('trade_decisions', '—'),
                 'entry_order_id': t.get('entry_order_id') or '—',
                 'exit_order_id':  t.get('exit_order_id')  or '—',
+                'had_break_even': bool(t.get('had_break_even')),
                 'id': str(t['id']) if t.get('id') else f"trade_{hash(t['entry_time'] + t['symbol'])}"
             } for t in trades],
             'pagination': {
@@ -4832,6 +4370,8 @@ def signal_scores_pnl():
             oid = str(r['order_id'])
             symbol = r['symbol']
             entry, exit_ord = pair_cache.get(oid, (None, None))
+            # UI-only metadata (does not affect PnL math)
+            entry_time = r.get('entry_time') or r.get('created_at')
 
             if oid == latest_oid and live_flag:
                 results[oid] = {
@@ -4843,6 +4383,8 @@ def signal_scores_pnl():
                     'entry_price': entry['avg_price'] if entry else None,
                     'exit_price': None,
                     'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                    'entry_time': entry_time,
+                    'had_break_even': False,
                 }
                 continue
 
@@ -4856,6 +4398,8 @@ def signal_scores_pnl():
                     'entry_price': None,
                     'exit_price': None,
                     'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                    'entry_time': entry_time,
+                    'had_break_even': False,
                 }
                 continue
 
@@ -4869,6 +4413,8 @@ def signal_scores_pnl():
                     'entry_price': entry['avg_price'],
                     'exit_price': None,
                     'lot_size': float(r['lot_size']) if r.get('lot_size') is not None else None,
+                    'entry_time': entry_time,
+                    'had_break_even': False,
                 }
                 continue
 
@@ -4886,7 +4432,37 @@ def signal_scores_pnl():
                 'exit_price': exit_ord['avg_price'],
                 'entry_side': entry['side'],
                 'lot_size': lot_size,
+                'entry_time': entry_time,
+                'had_break_even': False,
             }
+
+        # UI-only: attach had_break_even from closed_positions (no PnL / pairing change)
+        try:
+            closed_oids = [
+                oid for oid, info in results.items()
+                if info.get('status') == 'closed'
+            ]
+            if closed_oids:
+                placeholders = ','.join(['%s'] * len(closed_oids))
+                be_rows = execute_mysql_query(
+                    f'''
+                    SELECT entry_order_id, had_break_even
+                    FROM closed_positions
+                    WHERE entry_order_id IN ({placeholders})
+                    ''',
+                    tuple(closed_oids),
+                    fetch_all=True,
+                ) or []
+                be_map = {
+                    str(br['entry_order_id']): bool(br.get('had_break_even'))
+                    for br in be_rows
+                    if br.get('entry_order_id') is not None
+                }
+                for oid, info in results.items():
+                    if oid in be_map:
+                        info['had_break_even'] = be_map[oid]
+        except Exception as be_err:
+            log_error(f"[SS PnL] BE enrich (UI only) error: {be_err}")
 
         return jsonify({
             'success': True,
@@ -5063,73 +4639,17 @@ def apply_decision_tf_config(data: dict):
         return False, f'Invalid values: {e}'
 
 
-def _decision_tf_bias_net(score_map, key):
-    r = score_map.get(key)
-    if not r:
-        return 'NEUTRAL', 0
-    return r.get('bias', 'NEUTRAL'), int(r.get('net', 0) or 0)
+def _configure_bot_runtime():
+    """Give strategy bots access to app helpers without importing app.py."""
+    bot_manager.set_runtime_factory(lambda: {
+        'get_symbol': lambda: BOT_STATE.get('symbol', 'ETHUSD'),
+        'make_api_request': make_api_request,
+        'get_decision_tf_config': get_decision_tf_config,
+        'decision_tf_priority': DECISION_TF_PRIORITY,
+    })
 
 
-def _resolve_signal_from_selected_tfs(score_map, timeframe_scores, reason):
-    """
-    Final decision gate using only user-selected timeframes.
-    Does not place orders / touch bot loop — only returns signal or WAIT.
-    Returns (direction_or_None, wait_response_or_None).
-    """
-    tf_cfg = get_decision_tf_config()
-    enabled = [t for t in DECISION_TF_PRIORITY if tf_cfg.get(t)]
-    print(f"\n🎯 DECISION TFs (saved): {[t.upper() for t in enabled] or ['(none)']}")
-
-    if not enabled:
-        return None, _make_wait_signal(
-            reason,
-            "No decision timeframes enabled — save at least one in Decision Timeframes",
-            timeframe_scores=timeframe_scores
-        )
-
-    master = None
-    master_tf = None
-    for t in enabled:
-        bias, _ = _decision_tf_bias_net(score_map, t)
-        if bias in ('BUY', 'SELL'):
-            master, master_tf = bias, t
-            break
-
-    if not master:
-        return None, _make_wait_signal(
-            reason,
-            f"All selected TFs NEUTRAL ({', '.join(t.upper() for t in enabled)})",
-            timeframe_scores=timeframe_scores
-        )
-
-    print(f"   Master = {master_tf.upper()} → {master}")
-
-    mismatched = []
-    for t in enabled:
-        bias, _ = _decision_tf_bias_net(score_map, t)
-        if bias != master:
-            mismatched.append(f"{t.upper()}={bias}")
-    if mismatched:
-        why = f"Waiting for {', '.join(mismatched)} to align with {master_tf.upper()} {master}"
-        print(f"⏳ Confluence fail — {why}")
-        return None, _make_wait_signal(reason, why, timeframe_scores=timeframe_scores)
-
-    # Strength: prefer 15M if selected, else lowest selected TF
-    if '15m' in enabled:
-        entry_tf = '15m'
-        min_net = 4
-    else:
-        entry_tf = enabled[-1]  # lowest priority among enabled
-        min_net = 4
-    _, entry_net = _decision_tf_bias_net(score_map, entry_tf)
-    if abs(entry_net) < min_net:
-        why = f"{entry_tf.upper()} net={entry_net} too weak (need >={min_net})"
-        print(f"⏳ {why}")
-        return None, _make_wait_signal(reason, why, timeframe_scores=timeframe_scores)
-
-    aligned = '+'.join(t.upper() for t in enabled)
-    print(f"\n✅ {aligned} aligned on {master} — SIGNAL: {master}")
-    return master, None
+_configure_bot_runtime()
 
 
 @app.route('/api/decision-tf-config', methods=['GET'])
@@ -5166,6 +4686,9 @@ GUARDIAN_CONFIG_DEFAULTS = {
     'break_even_profit_offset': 3.5,     # Entry ke upar/niche SL offset (USD) — BE ONLY, fees se ab alag
     'break_even_retry_same_step': False, # BE SL hit → same step/lot (no double); PnL history unchanged
     'trading_fees': 3.5,                 # Per-side fee jo PnL formula me use hoti hai (replaces hardcoded `fees`)
+    # UI-only: flip final BUY↔SELL at order time. Not in bot scripts — works for any selected bot.
+    # Signal Scores History still stores the bot's original decision (never reversed).
+    'reverse_decision': False,
 }
 GUARDIAN_CONFIG = dict(GUARDIAN_CONFIG_DEFAULTS)
 _guardian_config_lock = Lock()
@@ -5197,7 +4720,8 @@ def save_guardian_config_to_db(cfg=None):
             f"BE_buf={payload.get('break_even_trigger_buffer')} "
             f"BE_offset={payload.get('break_even_profit_offset')} "
             f"BE_retry={payload.get('break_even_retry_same_step')} "
-            f"Fees={payload.get('trading_fees')}"
+            f"Fees={payload.get('trading_fees')} "
+            f"Reverse={payload.get('reverse_decision')}"
         )
         return True
     except Exception as e:
@@ -5237,6 +4761,13 @@ def load_guardian_config_from_db():
                 GUARDIAN_CONFIG.get('break_even_retry_same_step', False)
             )
             GUARDIAN_CONFIG['trading_fees'] = float(GUARDIAN_CONFIG.get('trading_fees', 3.5))
+            rev = GUARDIAN_CONFIG.get('reverse_decision', False)
+            if isinstance(rev, str):
+                GUARDIAN_CONFIG['reverse_decision'] = rev.strip().lower() in (
+                    '1', 'true', 'yes', 'y', 'on'
+                )
+            else:
+                GUARDIAN_CONFIG['reverse_decision'] = bool(rev)
 
         # PnL formula (exit-(entry+fees)) bilkul unchanged hai — sirf fees value ka source
         # hardcoded 3.5 se hatakar is config field pe move kiya hai.
@@ -5247,7 +4778,8 @@ def load_guardian_config_from_db():
             f"SL={GUARDIAN_CONFIG['live_sl_percentage']}% "
             f"BE_offset={GUARDIAN_CONFIG['break_even_profit_offset']} "
             f"BE_retry={GUARDIAN_CONFIG['break_even_retry_same_step']} "
-            f"Fees={GUARDIAN_CONFIG['trading_fees']}"
+            f"Fees={GUARDIAN_CONFIG['trading_fees']} "
+            f"Reverse={GUARDIAN_CONFIG['reverse_decision']}"
         )
         return True
     except Exception as e:
@@ -5277,6 +4809,11 @@ def apply_guardian_config(data: dict):
         else:
             be_retry = bool(be_retry)
         trading_fees = float(data.get('trading_fees', GUARDIAN_CONFIG.get('trading_fees', 3.5)))
+        rev = data.get('reverse_decision', GUARDIAN_CONFIG.get('reverse_decision', False))
+        if isinstance(rev, str):
+            rev = rev.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        else:
+            rev = bool(rev)
 
         if not (0.1 <= tp <= 50):
             return False, 'TP % must be between 0.1 and 50'
@@ -5306,6 +4843,7 @@ def apply_guardian_config(data: dict):
             'break_even_profit_offset': be_off,
             'break_even_retry_same_step': be_retry,
             'trading_fees': trading_fees,
+            'reverse_decision': rev,
         }
         with _guardian_config_lock:
             GUARDIAN_CONFIG.update(new_cfg)
@@ -5320,13 +4858,64 @@ def apply_guardian_config(data: dict):
 # ========== BREAK-EVEN STATE TRACKER ==========
 # key = product_id, value = be_new_sl price (float) or None
 _break_even_applied      = {}
-_positions_had_be_sl     = set()   # product_ids that had BE SL applied (for retry-same-step)
+# product_id -> BE SL price (survives position-close cleanup of _break_even_applied)
+_positions_had_be_sl     = {}
+# entry_order_id -> BE SL price (for history UI badge + DB had_break_even)
+_orders_had_be_sl        = {}
 _be_retry_pending        = {}      # symbol -> True after BE SL close (pre-order verify reads this)
 _break_even_applied_lock = Lock()
 
 
-def _resolve_be_retry_on_close(symbol):
-    """BE SL close + setting ON → same step retry (consumes product flag)."""
+def _mark_current_order_had_be(be_new_sl):
+    """When guardian moves SL to BE, tag the live entry order for history."""
+    oid = BOT_STATE.get('last_placed_order_id')
+    if not oid or oid == 'RESUMED':
+        return
+    with _break_even_applied_lock:
+        _orders_had_be_sl[str(oid)] = float(be_new_sl)
+
+
+def _peek_order_had_be(entry_order_id):
+    if not entry_order_id:
+        return False
+    with _break_even_applied_lock:
+        return str(entry_order_id) in _orders_had_be_sl
+
+
+def _consume_order_had_be(entry_order_id):
+    if not entry_order_id:
+        return False
+    with _break_even_applied_lock:
+        return _orders_had_be_sl.pop(str(entry_order_id), None) is not None
+
+
+def _exit_matches_be_sl(exit_price, be_sl_price, entry_price=None, side=None, tolerance=None):
+    """
+    True only when fill exit is at/near the BE SL stop (not TP).
+    BE SL = entry ± UI offset; TP is much farther — a TP fill must NOT match.
+    """
+    if exit_price is None or be_sl_price is None:
+        return False
+    try:
+        exit_p = float(exit_price)
+        be_sl = float(be_sl_price)
+    except (TypeError, ValueError):
+        return False
+
+    if tolerance is None:
+        # Cover market-order slip on BE SL without reaching TP distance
+        ref = abs(be_sl) if be_sl else abs(exit_p)
+        tolerance = max(2.0, ref * 0.0005)
+
+    return abs(exit_p - be_sl) <= tolerance
+
+
+def _resolve_be_retry_on_close(symbol, exit_price=None, entry_price=None, side=None):
+    """
+    BE SL hit + setting ON → same step retry.
+    Requires: position had BE SL applied AND exit fill matches that BE SL price.
+    TP after BE → normal win, no same-lot retry.
+    """
     gcfg = get_guardian_config()
     if not gcfg.get('break_even_retry_same_step'):
         return False
@@ -5335,10 +4924,38 @@ def _resolve_be_retry_on_close(symbol):
         return False
     pid = str(product_id)
     with _break_even_applied_lock:
-        if pid in _positions_had_be_sl:
-            _positions_had_be_sl.discard(pid)
+        if pid not in _positions_had_be_sl:
+            return False
+        # Prefer price stored at BE apply time (survives guardian clear on close)
+        be_sl_price = _positions_had_be_sl.pop(pid, None)
+        if be_sl_price is None:
+            be_sl_price = _break_even_applied.pop(pid, None)
+        else:
+            _break_even_applied.pop(pid, None)
+        if be_sl_price is None and entry_price is not None:
+            try:
+                offset = float(gcfg.get('break_even_profit_offset', 0))
+                ep = float(entry_price)
+                side_l = (str(side).lower() if side else '')
+                if side_l == 'buy':
+                    be_sl_price = ep + offset
+                elif side_l == 'sell':
+                    be_sl_price = ep - offset
+            except (TypeError, ValueError):
+                be_sl_price = None
+
+        matched = _exit_matches_be_sl(exit_price, be_sl_price, entry_price, side)
+        if matched:
+            log_system(
+                f"[BE SL RETRY] {symbol}: exit={exit_price} matched BE SL={be_sl_price} "
+                f"→ same step/lot"
+            )
             return True
-    return False
+        log_system(
+            f"[BE SL RETRY] {symbol}: had BE SL but exit={exit_price} != BE SL={be_sl_price} "
+            f"(likely TP) → normal step progression"
+        )
+        return False
 
 
 def _mark_be_retry_pending(symbol):
@@ -5351,20 +4968,42 @@ def _pop_be_retry_pending(symbol):
         return _be_retry_pending.pop(symbol, False)
 
 
-def _handle_close_step_progression(symbol, pnl):
-    """On close: BE SL + setting ON + loss → same step/lot; TP after BE = normal win."""
+def _handle_close_step_progression(symbol, pnl, exit_price=None, entry_price=None, side=None):
+    """
+    On close:
+      - BE SL actually hit (exit ≈ BE SL) + setting ON → same step/lot
+      - TP hit (even if BE was applied earlier) → normal win (Step 1)
+      - Normal SL / loss without BE → normal loss progression
+    """
     be_retry = False
     gcfg = get_guardian_config()
-    if gcfg.get('break_even_retry_same_step') and pnl <= 0:
-        be_retry = _resolve_be_retry_on_close(symbol)
-    elif pnl > 0:
+    if gcfg.get('break_even_retry_same_step'):
         product_id = get_product_id(symbol)
-        if product_id:
-            with _break_even_applied_lock:
-                _positions_had_be_sl.discard(str(product_id))
+        pid = str(product_id) if product_id else None
+
+        if exit_price is not None and pid:
+            # Decide from exit price vs stored BE SL — not from pnl alone
+            be_retry = _resolve_be_retry_on_close(
+                symbol, exit_price=exit_price, entry_price=entry_price, side=side
+            )
+        else:
+            # No exit price → cannot prove BE SL hit; clear flag, normal progression
+            if pid:
+                with _break_even_applied_lock:
+                    _positions_had_be_sl.pop(pid, None)
+                    _break_even_applied.pop(pid, None)
+            log_system(
+                f"[BE SL RETRY] {symbol}: close without exit price to verify BE SL "
+                f"(pnl={pnl:.5f}) — normal step progression"
+            )
+            be_retry = False
+
     _apply_step_progression(pnl, be_retry=be_retry)
     if be_retry:
         _mark_be_retry_pending(symbol)
+    else:
+        # Ensure stale pending from a prior close cannot override a TP/normal close
+        _pop_be_retry_pending(symbol)
 
 # ========== TP/SL GUARDIAN (with real-time mark price) ==========
 # UPDATED VERSION — fixes Break-Even not triggering issue
@@ -5568,15 +5207,48 @@ def auto_tp_sl_guardian():
                     # ── END BREAK-EVEN LOGIC ──────────────────────────────
 
                     # ── TP/SL existence check ─────────────────────────────
+                    # Stop TP/SL on Delta sit in state=pending until triggered.
+                    # Old query used state=open only → guardian never saw brackets,
+                    # thought they were missing, then silent-failed on re-place.
                     dynamic_tolerance = entry * 0.0005
 
-                    orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
+                    orders_response = make_api_request(
+                        'GET',
+                        f'/orders?product_ids={product_id}&states=open,pending'
+                    )
                     if not orders_response or not orders_response.get('success'):
+                        log_throttled(
+                            log_system, f"guardian_orders_fail_{pos_key}",
+                            f"[GUARDIAN] {symbol}: open/pending orders fetch failed — retry next cycle",
+                            min_interval=15
+                        )
                         continue
 
-                    orders    = orders_response.get("result", [])
-                    tp_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
-                    sl_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
+                    orders = orders_response.get("result", [])
+                    if isinstance(orders, dict):
+                        orders = orders.get("orders") or orders.get("result") or []
+                    if not isinstance(orders, list):
+                        orders = []
+
+                    def _is_reduce_only(o):
+                        v = o.get("reduce_only")
+                        return v is True or v == "true" or v == 1 or v == "1"
+
+                    def _stop_type(o):
+                        return (o.get("stop_order_type") or "").strip().lower()
+
+                    # Prefer reduce_only stops; fall back to stop_order_type alone
+                    # (some bracket legs may omit reduce_only in the payload).
+                    tp_orders = [
+                        o for o in orders
+                        if _stop_type(o) == "take_profit_order"
+                        and (_is_reduce_only(o) or o.get("stop_price") is not None)
+                    ]
+                    sl_orders = [
+                        o for o in orders
+                        if _stop_type(o) == "stop_loss_order"
+                        and (_is_reduce_only(o) or o.get("stop_price") is not None)
+                    ]
 
                     tp_valid        = False
                     sl_valid        = False
@@ -5584,7 +5256,7 @@ def auto_tp_sl_guardian():
                     wrong_sl_orders = []
 
                     for tp_order in tp_orders:
-                        stop_price = float(tp_order.get("stop_price", 0))
+                        stop_price = float(tp_order.get("stop_price", 0) or 0)
                         if abs(stop_price - expected_tp) < dynamic_tolerance:
                             tp_valid = True
                         else:
@@ -5593,22 +5265,35 @@ def auto_tp_sl_guardian():
                     with _break_even_applied_lock:
                         be_sl_price = _break_even_applied.get(pos_key)  # None ya BE SL price (float)
 
+                    # After BE: target SL is the BE price, not the original % SL
+                    sl_target = float(be_sl_price) if be_sl_price is not None else final_sl
+
                     for sl_order in sl_orders:
-                        stop_price = float(sl_order.get("stop_price", 0))
-                        if abs(stop_price - final_sl) < dynamic_tolerance:
+                        stop_price = float(sl_order.get("stop_price", 0) or 0)
+                        if abs(stop_price - sl_target) < dynamic_tolerance:
                             sl_valid = True
                         elif be_sl_price is not None and abs(stop_price - be_sl_price) < dynamic_tolerance:
                             sl_valid = True  # BE SL hai, guardian isko overwrite nahi karega
                         else:
                             wrong_sl_orders.append(sl_order)
 
+                    log_throttled(
+                        log_system, f"guardian_status_{pos_key}",
+                        f"[GUARDIAN] {symbol} | size={size} entry={entry:.4f} "
+                        f"expect_tp={expected_tp:.4f} expect_sl={sl_target:.4f} | "
+                        f"tp_orders={len(tp_orders)} sl_orders={len(sl_orders)} "
+                        f"tp_ok={tp_valid} sl_ok={sl_valid} "
+                        f"wrong_tp={len(wrong_tp_orders)} wrong_sl={len(wrong_sl_orders)}",
+                        min_interval=20
+                    )
+
                     tp_edited = False
                     sl_edited = False
 
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
-                            order_id     = tp_order.get("id")
-                            log_system(f"EDITING TP order {order_id}...")
+                            order_id = tp_order.get("id")
+                            log_system(f"[GUARDIAN] EDITING TP order {order_id} → {expected_tp:.2f}")
                             edit_payload = {
                                 "id": order_id,
                                 "product_id": int(product_id),
@@ -5625,21 +5310,25 @@ def auto_tp_sl_guardian():
                                     timeout=10
                                 )
                                 if edit_res.status_code == 200:
-                                    log_system(f"TP EDITED")
+                                    log_system(f"[GUARDIAN] TP EDITED → {expected_tp:.2f}")
                                     tp_edited = True
                                     break
-                            except Exception:
-                                pass
+                                log_system(
+                                    f"[GUARDIAN] TP EDIT FAILED {order_id}: "
+                                    f"HTTP {edit_res.status_code} {edit_res.text[:300]}"
+                                )
+                            except Exception as edit_err:
+                                log_system(f"[GUARDIAN] TP EDIT exception: {edit_err}")
 
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
-                            order_id     = sl_order.get("id")
-                            log_system(f"EDITING SL order {order_id}...")
+                            order_id = sl_order.get("id")
+                            log_system(f"[GUARDIAN] EDITING SL order {order_id} → {sl_target:.2f}")
                             edit_payload = {
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(final_sl),
+                                "stop_price": "{:.2f}".format(sl_target),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -5651,14 +5340,31 @@ def auto_tp_sl_guardian():
                                     timeout=10
                                 )
                                 if edit_res.status_code == 200:
-                                    log_system(f"SL EDITED")
+                                    log_system(f"[GUARDIAN] SL EDITED → {sl_target:.2f}")
                                     sl_edited = True
                                     break
-                            except Exception:
-                                pass
+                                log_system(
+                                    f"[GUARDIAN] SL EDIT FAILED {order_id}: "
+                                    f"HTTP {edit_res.status_code} {edit_res.text[:300]}"
+                                )
+                            except Exception as edit_err:
+                                log_system(f"[GUARDIAN] SL EDIT exception: {edit_err}")
 
-                    need_tp = not tp_valid and not tp_edited
-                    need_sl = not sl_valid and not sl_edited
+                    need_tp = not tp_valid and not tp_edited and len(tp_orders) == 0
+                    need_sl = not sl_valid and not sl_edited and len(sl_orders) == 0
+
+                    # Wrong orders still present after failed edit — do NOT place
+                    # a second bracket (Delta allows only one position bracket).
+                    if (wrong_tp_orders and not tp_valid and not tp_edited) or \
+                       (wrong_sl_orders and not sl_valid and not sl_edited):
+                        log_throttled(
+                            log_system, f"guardian_edit_pending_{pos_key}",
+                            f"[GUARDIAN] {symbol}: wrong TP/SL still present after edit "
+                            f"attempt — will retry edit next cycle (no delete, no duplicate)",
+                            min_interval=15
+                        )
+                        need_tp = False
+                        need_sl = False
 
                     if need_tp or need_sl:
                         with MARK_PRICES_LOCK:
@@ -5669,29 +5375,59 @@ def auto_tp_sl_guardian():
                                 curr_price = float(ticker['result']['mark_price']
                                                    or ticker['result']['close'])
 
+                        # Per-leg safety: skip only the leg that would fire immediately
+                        place_tp = need_tp
+                        place_sl = need_sl
                         if curr_price is not None:
-                            is_safe = True
-                            if size > 0:
-                                if expected_tp <= curr_price or final_sl >= curr_price:
-                                    is_safe = False
-                            else:
-                                if expected_tp >= curr_price or final_sl <= curr_price:
-                                    is_safe = False
-                            if not is_safe:
-                                continue
+                            if size > 0:  # LONG
+                                if place_tp and expected_tp <= curr_price:
+                                    log_system(
+                                        f"[GUARDIAN] {symbol}: skip TP place — "
+                                        f"tp={expected_tp:.4f} <= live={curr_price:.4f}"
+                                    )
+                                    place_tp = False
+                                if place_sl and sl_target >= curr_price:
+                                    log_system(
+                                        f"[GUARDIAN] {symbol}: skip SL place — "
+                                        f"sl={sl_target:.4f} >= live={curr_price:.4f} "
+                                        f"(would trigger immediately)"
+                                    )
+                                    place_sl = False
+                            else:  # SHORT
+                                if place_tp and expected_tp >= curr_price:
+                                    log_system(
+                                        f"[GUARDIAN] {symbol}: skip TP place — "
+                                        f"tp={expected_tp:.4f} >= live={curr_price:.4f}"
+                                    )
+                                    place_tp = False
+                                if place_sl and sl_target <= curr_price:
+                                    log_system(
+                                        f"[GUARDIAN] {symbol}: skip SL place — "
+                                        f"sl={sl_target:.4f} <= live={curr_price:.4f} "
+                                        f"(would trigger immediately)"
+                                    )
+                                    place_sl = False
 
-                        log_system(f"Placing missing TP/SL for {symbol}")
-                        payload = {
-                            "product_id": int(product_id),
-                            "take_profit_order": {
+                        if not place_tp and not place_sl:
+                            continue
+
+                        payload = {"product_id": int(product_id)}
+                        if place_tp:
+                            payload["take_profit_order"] = {
                                 "order_type": "market_order",
                                 "stop_price": "{:.2f}".format(expected_tp)
-                            },
-                            "stop_loss_order": {
-                                "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(final_sl)
                             }
-                        }
+                        if place_sl:
+                            payload["stop_loss_order"] = {
+                                "order_type": "market_order",
+                                "stop_price": "{:.2f}".format(sl_target)
+                            }
+
+                        log_system(
+                            f"[GUARDIAN] Placing missing bracket for {symbol} | "
+                            f"tp={'Y' if place_tp else 'N'}@{expected_tp:.2f} "
+                            f"sl={'Y' if place_sl else 'N'}@{sl_target:.2f}"
+                        )
                         body = json.dumps(payload)
                         try:
                             res = requests.post(
@@ -5701,16 +5437,30 @@ def auto_tp_sl_guardian():
                                 timeout=10
                             )
                             if res.status_code == 200:
-                                log_system(f"Bracket placed for {symbol}")
-                        except Exception:
-                            pass
+                                log_system(f"[GUARDIAN] Bracket placed for {symbol}")
+                            else:
+                                log_system(
+                                    f"[GUARDIAN] Bracket place FAILED {symbol}: "
+                                    f"HTTP {res.status_code} {res.text[:300]}"
+                                )
+                        except Exception as place_err:
+                            log_system(f"[GUARDIAN] Bracket place exception: {place_err}")
 
                     time.sleep(0.3)
 
-                except Exception:
-                    pass
+                except Exception as pos_err:
+                    log_throttled(
+                        log_system, "guardian_pos_exc",
+                        f"[GUARDIAN] position-loop error: {pos_err}",
+                        min_interval=15
+                    )
 
-        except Exception:
+        except Exception as loop_err:
+            log_throttled(
+                log_system, "guardian_loop_exc",
+                f"[GUARDIAN] main-loop error: {loop_err}",
+                min_interval=15
+            )
             time.sleep(2)
 
 def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
@@ -5720,12 +5470,20 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
     CHANGE 1: Stores be_new_sl price (float) instead of True in tracker.
     """
     be_new_sl    = round_price_2dp(be_new_sl)
-    orders_be    = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
+    # pending = untriggered stops; open alone misses TP/SL brackets
+    orders_be    = make_api_request(
+        'GET', f'/orders?product_ids={product_id}&states=open,pending'
+    )
     sl_orders_be = []
     if orders_be and orders_be.get('success'):
+        raw = orders_be.get("result", [])
+        if isinstance(raw, dict):
+            raw = raw.get("orders") or []
+        if not isinstance(raw, list):
+            raw = []
         sl_orders_be = [
-            o for o in orders_be.get("result", [])
-            if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"
+            o for o in raw
+            if (o.get("stop_order_type") or "").strip().lower() == "stop_loss_order"
         ]
 
     be_sl_set = False
@@ -5756,7 +5514,8 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
                 # CHANGE 1: True ki jagah be_new_sl price store karo
                 with _break_even_applied_lock:
                     _break_even_applied[pos_key] = be_new_sl
-                    _positions_had_be_sl.add(pos_key)
+                    _positions_had_be_sl[pos_key] = be_new_sl
+                _mark_current_order_had_be(be_new_sl)
                 be_sl_set = True
                 break
         except Exception:
@@ -5787,7 +5546,8 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
                 # CHANGE 1: True ki jagah be_new_sl price store karo
                 with _break_even_applied_lock:
                     _break_even_applied[pos_key] = be_new_sl
-                    _positions_had_be_sl.add(pos_key)
+                    _positions_had_be_sl[pos_key] = be_new_sl
+                _mark_current_order_had_be(be_new_sl)
         except Exception:
             pass
 
@@ -5845,10 +5605,17 @@ if __name__ == '__main__':
             BOT_STATE['leverage']   = session_flag.get('leverage', BOT_STATE['leverage'])
             BOT_STATE['tp_percent'] = session_flag.get('tp_percent', BOT_STATE['tp_percent'])
             BOT_STATE['sl_percent'] = session_flag.get('sl_percent', BOT_STATE['sl_percent'])
+            resume_bot = session_flag.get('strategy_bot') or 'bot1'
+            ok_bot, bot_msg, _ = bot_manager.activate_bot(resume_bot)
+            if not ok_bot:
+                print(f"⚠️ Auto-resume strategy activate failed ({bot_msg}) — falling back to bot1")
+                ok_bot, bot_msg, _ = bot_manager.activate_bot('bot1')
+            if ok_bot:
+                print(f"✅ Strategy loaded for resume: {bot_msg}")
             start_websocket_engine()
             time.sleep(1)
             if start_auto_trading_bot():
-                print(f"✅ Auto-resumed bot for symbol={BOT_STATE['symbol']}")
+                print(f"✅ Auto-resumed bot for symbol={BOT_STATE['symbol']} strategy={resume_bot}")
             else:
                 print("⚠️ Auto-resume attempted but bot did not start")
         else:

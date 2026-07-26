@@ -604,6 +604,39 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
 }
 .modal-sum-lbl{font-family:var(--font-mono);font-size:9px;color:var(--muted);margin-bottom:4px;letter-spacing:1px}
 .modal-sum-val{font-family:var(--font-display);font-size:16px;font-weight:700}
+/* Signal Scores PnL summary (info-only UI) */
+.ss-pnl-dash{
+  display:grid;grid-template-columns:repeat(4,1fr);
+  gap:1px;background:var(--border);
+  border-bottom:1px solid var(--border2);
+}
+.ss-pnl-cell{
+  background:rgba(6,12,22,.75);
+  padding:14px 12px;text-align:center;
+}
+[data-theme="light"] .ss-pnl-cell{background:rgba(255,255,255,.65)}
+.ss-pnl-lbl{
+  font-family:var(--font-mono);font-size:9px;color:var(--muted);
+  letter-spacing:1.2px;text-transform:uppercase;margin-bottom:6px;
+}
+.ss-pnl-val{
+  font-family:var(--font-display);font-size:18px;font-weight:800;line-height:1.1;
+}
+.ss-pnl-sub{
+  font-family:var(--font-mono);font-size:9px;color:var(--muted);margin-top:5px;
+}
+.ss-pnl-graph-wrap{
+  height:200px;padding:12px 14px 6px;position:relative;
+}
+.ss-pnl-hint{
+  font-family:var(--font-mono);font-size:9px;color:var(--muted);
+  padding:0 14px 12px;letter-spacing:.3px;
+}
+.ss-be-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  border:1px solid rgba(255,180,0,.45);color:#ffb400;
+  font-size:8px;letter-spacing:.4px;margin-left:4px;vertical-align:middle;
+}
 .modal-filters{
   padding:12px 16px;
   display:flex;gap:8px;align-items:center;
@@ -1094,6 +1127,18 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
         <input type="number" id="streakSteps" class="cfg-input" value="4" step="1" min="1" max="20" oninput="previewLotSteps()">
       </div>
       <div class="cfg-item full">
+        <label class="cfg-label">Strategy Bot (decision engine)</label>
+        <select id="strategyBot" class="cfg-input">
+          <option value="bot1">Bot 1 — Signal Engine v7</option>
+          <option value="bot2" disabled>Bot 2 — (empty — paste code later)</option>
+          <option value="bot3" disabled>Bot 3 — (empty — paste code later)</option>
+          <option value="bot4" disabled>Bot 4 — (empty — paste code later)</option>
+        </select>
+        <span class="cfg-hint" style="display:block;margin-top:6px;font-family:var(--font-mono);font-size:9px;color:var(--muted);line-height:1.4">
+          Choose BEFORE start. Only the selected bot file loads into RAM. Empty bots stay unloaded until you paste strategy code and set BOT_READY=True.
+        </span>
+      </div>
+      <div class="cfg-item full">
         <label class="cfg-label">Lot Sequence Preview (S × 2ⁿ⁻¹)</label>
         <div id="lotStepsPreview" class="cfg-input" style="min-height:42px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;cursor:default">
           <span style="color:var(--muted)">Step1=1 → Step2=2 → Step3=4 → Step4=8</span>
@@ -1187,6 +1232,14 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
           <option value="true">On — BE SL retry same lot</option>
         </select>
         <span class="cfg-hint">BE SL hit → lot double nahi, wahi step dubara. History me chhota loss normal. <span class="unit">On/Off</span></span>
+      </div>
+      <div class="cfg-item">
+        <label class="cfg-label">Reverse Decision</label>
+        <select id="gReverseDecision" class="cfg-input">
+          <option value="false">Off — trade as bot says</option>
+          <option value="true">On — BUY↔SELL flip</option>
+        </select>
+        <span class="cfg-hint">Final decision pe apply: BUY→SELL, SELL→BUY. Kisi bhi bot pe kaam karta hai (bot script me nahi). Signal history me original decision hi dikhega. <span class="unit">On/Off</span></span>
       </div>
     </div>
     <div class="btn-grid">
@@ -1288,6 +1341,35 @@ input[type="checkbox"]{width:14px;height:14px;accent-color:var(--cyan);cursor:po
         <button class="btn btn-outline btn-amber" style="padding:5px 10px;font-size:9px;height:auto;min-height:28px" onclick="clearAllSignalScores()">🗑️ CLEAR ALL</button>
       </div>
     </div>
+
+    <!-- Signal PnL summary + graph (populated after SEE PnL — display only) -->
+    <div class="ss-pnl-dash" id="ssPnlDash">
+      <div class="ss-pnl-cell">
+        <div class="ss-pnl-lbl">Total P&amp;L</div>
+        <div class="ss-pnl-val" id="ssTotalPnl" style="color:var(--muted)">—</div>
+        <div class="ss-pnl-sub" id="ssTotalPnlSub">Press SEE PnL</div>
+      </div>
+      <div class="ss-pnl-cell">
+        <div class="ss-pnl-lbl">Win Rate</div>
+        <div class="ss-pnl-val" id="ssWinRate" style="color:var(--muted)">—</div>
+        <div class="ss-pnl-sub" id="ssWinRateSub">wins / decisions</div>
+      </div>
+      <div class="ss-pnl-cell">
+        <div class="ss-pnl-lbl">BE Ratio</div>
+        <div class="ss-pnl-val" id="ssBeRatio" style="color:var(--muted)">—</div>
+        <div class="ss-pnl-sub" id="ssBeRatioSub">break-even exits</div>
+      </div>
+      <div class="ss-pnl-cell">
+        <div class="ss-pnl-lbl">Closed Signals</div>
+        <div class="ss-pnl-val" id="ssClosedCount" style="color:var(--text)">—</div>
+        <div class="ss-pnl-sub" id="ssClosedSub">of — snapshots</div>
+      </div>
+    </div>
+    <div class="ss-pnl-graph-wrap">
+      <canvas id="ssPnlChart"></canvas>
+    </div>
+    <div class="ss-pnl-hint" id="ssPnlHint">Cumulative signal P&amp;L graph appears after you load PnL from fills.</div>
+
     <div class="table-scroll">
       <table>
         <thead>
@@ -1758,11 +1840,13 @@ document.addEventListener('DOMContentLoaded',()=>{
   fetchSystemIP();
   fetchSystemResources();
   initializePnLChart();
+  ensureSsPnlChart();
   loadSignalScoresPage(1);
   loadBotConfig();
   loadGuardianConfig();
   loadLotStepsConfig();
   loadDecisionTfConfig();
+  loadStrategyBots();
   buildGraphFromDB().then(()=>{
     initState().then(()=>{
       updateUI();
@@ -1890,9 +1974,10 @@ async function loadGuardianConfig(){
     $('gBeOffset').value=c.break_even_profit_offset;
     $('gBeRetrySame').value=c.break_even_retry_same_step?'true':'false';
     $('gTradingFees').value=c.trading_fees;
+    if($('gReverseDecision')) $('gReverseDecision').value=c.reverse_decision?'true':'false';
     const st=$('guardianSaveStatus');
     if(st) st.textContent='Loaded from DB';
-    cachedGuardianSummary=`TP ${c.live_tp_percentage}% · SL ${c.live_sl_percentage}% · Liq ${c.liquidation_protection} · BE ${c.break_even_enabled?'On':'Off'} · Fees $${c.trading_fees}`;
+    cachedGuardianSummary=`TP ${c.live_tp_percentage}% · SL ${c.live_sl_percentage}% · Liq ${c.liquidation_protection} · BE ${c.break_even_enabled?'On':'Off'} · Rev ${c.reverse_decision?'On':'Off'} · Fees $${c.trading_fees}`;
     updateActiveSettingsSummary();
   }catch(e){
     console.error('Guardian config load failed',e);
@@ -1911,7 +1996,8 @@ async function saveGuardianConfig(){
     break_even_trigger_buffer:parseFloat($('gBeTrigBuf').value),
     break_even_profit_offset:parseFloat($('gBeOffset').value),
     break_even_retry_same_step:$('gBeRetrySame').value==='true',
-    trading_fees:parseFloat($('gTradingFees').value)
+    trading_fees:parseFloat($('gTradingFees').value),
+    reverse_decision:$('gReverseDecision')?$('gReverseDecision').value==='true':false
   };
   try{
     if(btn){btn.disabled=true;btn.textContent='SAVING...'}
@@ -1930,8 +2016,9 @@ async function saveGuardianConfig(){
         $('gBeOffset').value=d.config.break_even_profit_offset;
         $('gBeRetrySame').value=d.config.break_even_retry_same_step?'true':'false';
         $('gTradingFees').value=d.config.trading_fees;
+        if($('gReverseDecision')) $('gReverseDecision').value=d.config.reverse_decision?'true':'false';
       }
-      cachedGuardianSummary=`TP ${body.live_tp_percentage}% · SL ${body.live_sl_percentage}% · Liq ${body.liquidation_protection} · BE ${body.break_even_enabled?'On':'Off'} · Fees $${body.trading_fees}`;
+      cachedGuardianSummary=`TP ${body.live_tp_percentage}% · SL ${body.live_sl_percentage}% · Liq ${body.liquidation_protection} · BE ${body.break_even_enabled?'On':'Off'} · Rev ${body.reverse_decision?'On':'Off'} · Fees $${body.trading_fees}`;
       updateActiveSettingsSummary();
     }else{
       if(st){st.textContent='Error';st.style.color='var(--red)'}
@@ -2107,15 +2194,46 @@ async function initState(){
 function syncEngineUI(){
   const sb=$('statusBadge'),dot=$('statusDot'),st=$('statusText'),btn=$('startBtn');
   const saw=$('stopAtWinBtn'),sam=$('stopAtMaxBtn');
+  const strat=$('strategyBot');
   if(isEngineRunning){
     sb.className='status-pill online';dot.className='status-dot blink';
     btn.textContent='▶ ENGINE RUNNING';btn.className='btn btn-running';btn.disabled=true;
     saw.disabled=false;sam.disabled=false;
+    if(strat) strat.disabled=true;
   }else{
     sb.className='status-pill offline';dot.className='status-dot';st.textContent='OFFLINE';
     btn.textContent='▶ START ENGINE';btn.className='btn btn-start';btn.disabled=false;
     saw.disabled=true;sam.disabled=true;
+    if(strat){
+      // re-enable only ready options (empty bots stay disabled)
+      Array.from(strat.options).forEach(o=>{
+        if(o.dataset.ready!==undefined) o.disabled=o.dataset.ready!=='1';
+      });
+      strat.disabled=false;
+    }
   }
+}
+
+async function loadStrategyBots(){
+  const sel=$('strategyBot');
+  if(!sel) return;
+  try{
+    const r=await fetch('/api/bots');
+    const d=await r.json();
+    if(!d.success||!d.bots) return;
+    const saved=localStorage.getItem('strategyBot')||'bot1';
+    sel.innerHTML='';
+    d.bots.forEach(b=>{
+      const opt=document.createElement('option');
+      opt.value=b.id;
+      opt.textContent=b.ready?b.name:(b.name+' — empty');
+      opt.dataset.ready=b.ready?'1':'0';
+      opt.disabled=!b.ready;
+      sel.appendChild(opt);
+    });
+    const pick=d.bots.find(b=>b.id===saved&&b.ready)||d.bots.find(b=>b.ready)||d.bots[0];
+    if(pick) sel.value=pick.id;
+  }catch(e){console.error('loadStrategyBots',e)}
 }
 
 function saveState(running){isEngineRunning=running;localStorage.setItem('engineRunning',running);syncEngineUI()}
@@ -2140,6 +2258,10 @@ async function updateUI(){
 
     if(s.success){
       if(s.status.running!==isEngineRunning) saveState(s.status.running);
+      if(s.status.strategy_bot && $('strategyBot')){
+        const sb=$('strategyBot');
+        if([...sb.options].some(o=>o.value===s.status.strategy_bot)) sb.value=s.status.strategy_bot;
+      }
 
       const cs=s.status.current_step||1,ms=s.status.max_steps||11;
       const pct=Math.min((cs-1)/(ms-1),1);
@@ -2313,11 +2435,17 @@ async function loadTradesPage(page){
 // ═══════════════════════════════════════════════════
 async function startBot(){
   try{
-    const r=await fetch('/api/start-bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value,leverage:parseInt($('leverage').value),tp_percent:parseFloat($('tpPercent').value),sl_percent:parseFloat($('slPercent').value),start_lot:parseFloat($('startLot').value),streak:parseInt($('streakSteps').value,10)})});
+    const strategyBot=$('strategyBot')?.value||'bot1';
+    localStorage.setItem('strategyBot',strategyBot);
+    const r=await fetch('/api/start-bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value,leverage:parseInt($('leverage').value),tp_percent:parseFloat($('tpPercent').value),sl_percent:parseFloat($('slPercent').value),start_lot:parseFloat($('startLot').value),streak:parseInt($('streakSteps').value,10),strategy_bot:strategyBot})});
     const d=await r.json();
     if(d.success){
       saveState(true);
       startLivePolling();
+      if(d.strategy_name){
+        const chip=$('strategyBot');
+        if(chip) chip.title='Active: '+d.strategy_name;
+      }
       if(d.current_step&&d.current_lot!=null){
         const cl=Math.abs(d.current_lot);
         setVal('currentStep',d.current_step);setVal('currentLot',cl);
@@ -2421,6 +2549,7 @@ let ssManualPage  = false;
 let ssPnlMap      = {};   // order_id -> pnl payload (filled only after SEE PnL)
 let ssPnlLoaded   = false;
 let ssLastRows    = [];   // current page rows cache for re-render with PnL
+let ssPnlChart    = null;
 
 let ssModalAll=[];
 let ssModalFiltered=[];
@@ -2452,12 +2581,146 @@ function formatSsPnlCell(orderId){
     const pnl=parseFloat(info.pnl);
     const sign=pnl>=0?'+':'-';
     const cls=pnl>=0?'pnl-p2':'pnl-n2';
-    return `<span class="${cls}" style="font-weight:600">${sign}$${Math.abs(pnl).toFixed(5)}</span>`;
+    const beBadge = info.had_break_even
+      ? '<span class="ss-be-badge">BE</span>'
+      : '';
+    return `<span class="${cls}" style="font-weight:600">${sign}$${Math.abs(pnl).toFixed(5)}</span>${beBadge}`;
   }
   if(info.status==='pending'){
     return '<span style="color:var(--amber,#ffb400);font-size:9px">exit pending</span>';
   }
   return `<span style="color:var(--muted);font-size:9px">${info.tag||'not found'}</span>`;
+}
+
+function ensureSsPnlChart(){
+  if(ssPnlChart) return ssPnlChart;
+  const canvas=document.getElementById('ssPnlChart');
+  if(!canvas || typeof Chart==='undefined') return null;
+  const ctx=canvas.getContext('2d');
+  ssPnlChart=new Chart(ctx,{
+    type:'line',
+    data:{labels:[],datasets:[{
+      label:'Signal Cumulative P&L',data:[],
+      borderColor:'rgb(0,170,255)',backgroundColor:'rgba(0,170,255,0.07)',
+      borderWidth:2,tension:.35,pointRadius:3,
+      pointBackgroundColor:'rgb(0,170,255)',pointBorderColor:'rgba(0,0,0,.4)',
+      pointBorderWidth:1,fill:true,
+    }]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          backgroundColor:'rgba(2,4,8,.95)',titleColor:'rgba(0,170,255,.85)',
+          bodyColor:'#d0e8f8',borderColor:'rgba(0,170,255,.35)',borderWidth:1,
+          displayColors:false,padding:10,
+          titleFont:{family:"'Share Tech Mono',monospace",size:10},
+          bodyFont:{family:"'Share Tech Mono',monospace",size:11,weight:'bold'},
+          callbacks:{
+            label:c=>`Cum P&L: ${c.parsed.y>=0?'+':''}$${c.parsed.y.toFixed(5)}`,
+            afterLabel:(c)=>{
+              const raw=c.raw;
+              // Chart.js stores only y; use custom meta via dataset._metaPnl if present
+              const meta=(ssPnlChart&&ssPnlChart._ssPointMeta)||[];
+              const m=meta[c.dataIndex];
+              if(!m) return '';
+              const sign=m.pnl>=0?'+':'-';
+              return `Trade: ${sign}$${Math.abs(m.pnl).toFixed(5)}${m.be?' · BE':''}`;
+            }
+          }
+        }
+      },
+      scales:{
+        x:{grid:{color:'rgba(0,170,255,.04)',drawBorder:false},ticks:{color:'#3a5060',font:{family:"'Share Tech Mono',monospace",size:9},maxTicksLimit:10},border:{display:false}},
+        y:{grid:{color:'rgba(0,170,255,.04)',drawBorder:false},ticks:{color:'#3a5060',font:{family:"'Share Tech Mono',monospace",size:9},callback:v=>(v>=0?'+':'-')+'$'+Math.abs(v).toFixed(4)},border:{display:false}}
+      }
+    }
+  });
+  return ssPnlChart;
+}
+
+function updateSignalScoresStatsUI(){
+  const totalEl=$('ssTotalPnl'), winEl=$('ssWinRate'), beEl=$('ssBeRatio'), closedEl=$('ssClosedCount');
+  const totalSub=$('ssTotalPnlSub'), winSub=$('ssWinRateSub'), beSub=$('ssBeRatioSub'), closedSub=$('ssClosedSub'), hint=$('ssPnlHint');
+  if(!ssPnlLoaded){
+    if(totalEl){totalEl.textContent='—';totalEl.style.color='var(--muted)'}
+    if(winEl){winEl.textContent='—';winEl.style.color='var(--muted)'}
+    if(beEl){beEl.textContent='—';beEl.style.color='var(--muted)'}
+    if(closedEl) closedEl.textContent='—';
+    if(totalSub) totalSub.textContent='Press SEE PnL';
+    if(hint) hint.textContent='Cumulative signal P&L graph appears after you load PnL from fills.';
+    return;
+  }
+
+  const entries=Object.entries(ssPnlMap);
+  const closed=entries.filter(([,v])=>v && v.status==='closed' && v.pnl!=null);
+  const beTrades=closed.filter(([,v])=>!!v.had_break_even);
+  // Win/loss exclude BE exits so win rate reflects directional outcomes
+  const decided=closed.filter(([,v])=>!v.had_break_even);
+  const wins=decided.filter(([,v])=>parseFloat(v.pnl)>0);
+  const losses=decided.filter(([,v])=>parseFloat(v.pnl)<=0);
+  const totalPnl=closed.reduce((s,[,v])=>s+parseFloat(v.pnl||0),0);
+  const winRate=decided.length ? (wins.length/decided.length)*100 : 0;
+  const beRatio=closed.length ? (beTrades.length/closed.length)*100 : 0;
+
+  if(totalEl){
+    const sign=totalPnl>=0?'+':'-';
+    totalEl.textContent=`${sign}$${Math.abs(totalPnl).toFixed(5)}`;
+    totalEl.style.color=totalPnl>=0?'var(--cyan2)':'var(--red)';
+  }
+  if(totalSub) totalSub.textContent=`${closed.length} closed · ${entries.length} signals`;
+
+  if(winEl){
+    winEl.textContent=`${winRate.toFixed(1)}%`;
+    winEl.style.color=winRate>=50?'var(--cyan2)':(decided.length?'var(--red)':'var(--muted)');
+  }
+  if(winSub) winSub.textContent=`${wins.length}W / ${losses.length}L (excl. BE)`;
+
+  if(beEl){
+    beEl.textContent=`${beRatio.toFixed(1)}%`;
+    beEl.style.color=beTrades.length?'#ffb400':'var(--muted)';
+  }
+  if(beSub) beSub.textContent=`${beTrades.length} BE / ${closed.length} closed`;
+
+  if(closedEl) closedEl.textContent=String(closed.length);
+  if(closedSub) closedSub.textContent=`of ${entries.length} snapshots`;
+
+  // Cumulative graph — chronological by entry_time
+  const chart=ensureSsPnlChart();
+  if(chart){
+    const sorted=[...closed].sort((a,b)=>{
+      const ta=a[1].entry_time||'';
+      const tb=b[1].entry_time||'';
+      if(ta!==tb) return ta<tb?-1:1;
+      return String(a[0]).localeCompare(String(b[0]));
+    });
+    let cum=0;
+    const labels=[];
+    const data=[];
+    const meta=[];
+    sorted.forEach(([oid,info],i)=>{
+      const pnl=parseFloat(info.pnl)||0;
+      cum+=pnl;
+      const dt=info.entry_time?new Date(info.entry_time):null;
+      labels.push(dt && !isNaN(dt) ? dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}) : `#${i+1}`);
+      data.push(Number(cum.toFixed(8)));
+      meta.push({pnl, be:!!info.had_break_even, oid});
+    });
+    chart.data.labels=labels;
+    chart.data.datasets[0].data=data;
+    chart._ssPointMeta=meta;
+    const lc=cum>=0?'rgb(0,221,180)':'rgb(255,70,110)';
+    chart.data.datasets[0].borderColor=lc;
+    chart.data.datasets[0].pointBackgroundColor=lc;
+    chart.data.datasets[0].backgroundColor=cum>=0?'rgba(0,221,180,0.07)':'rgba(255,70,110,0.07)';
+    chart.update('none');
+  }
+  if(hint){
+    hint.textContent=closed.length
+      ? `Graph: ${closed.length} closed signal fills · cumulative P&L (oldest → newest)`
+      : 'No closed signal fills yet — open/pending rows are excluded from the graph.';
+  }
 }
 
 async function loadSignalScoresPage(page){
@@ -2529,6 +2792,7 @@ async function showSignalScoresPnl(){
     ssPnlLoaded=true;
     renderSignalScores(ssLastRows);
     if(ssModalLoaded) renderSsModalRows();
+    updateSignalScoresStatsUI();
     if(btn) btn.textContent='◈ REFRESH PnL';
   }catch(e){
     alert('Error: '+e.message);
@@ -2698,7 +2962,7 @@ async function downloadSignalScoresCsv(){
     const d=await r.json();
     const scores=d.scores||[];
     if(!scores.length){alert('No signal scores to export');return}
-    const headers=['entry_time','order_id','symbol','position','lot_size','tf_1m','tf_5m','tf_15m','tf_30m','tf_1h','tf_2h','tf_4h','tf_1d','tf_1w','final_decision','pnl','pnl_status','exit_order_id'];
+    const headers=['entry_time','order_id','symbol','position','lot_size','tf_1m','tf_5m','tf_15m','tf_30m','tf_1h','tf_2h','tf_4h','tf_1d','tf_1w','final_decision','pnl','pnl_status','had_break_even','exit_order_id'];
     const rows=scores.map(s=>{
       const info=ssPnlMap[String(s.order_id)]||{};
       return [
@@ -2707,6 +2971,7 @@ async function downloadSignalScoresCsv(){
         s.final_decision,
         info.pnl!=null?info.pnl:(info.tag||''),
         info.status||(ssPnlLoaded?'':'press_see_pnl'),
+        info.had_break_even?1:0,
         info.exit_order_id||''
       ];
     });
@@ -2752,6 +3017,13 @@ async function clearAllSignalScores() {
       ssPnlMap={};ssPnlLoaded=false;ssModalLoaded=false;
       const btn=$('ssSeePnlBtn');
       if(btn) btn.textContent='◈ SEE PnL';
+      if(ssPnlChart){
+        ssPnlChart.data.labels=[];
+        ssPnlChart.data.datasets[0].data=[];
+        ssPnlChart._ssPointMeta=[];
+        ssPnlChart.update('none');
+      }
+      updateSignalScoresStatsUI();
       await loadSignalScoresPage(1);
     } else {
       alert(data.message);
