@@ -5057,6 +5057,11 @@ def _handle_close_step_progression(symbol, pnl, exit_price=None, entry_price=Non
 #
 # Replace your existing auto_tp_sl_guardian function with this ENTIRE function.
 
+# ★ Guardian sirf isi ek market ke TP/SL/BE ko guard karega.
+# Baaki kisi bhi symbol ki position ko guardian bilkul ignore karega (touch nahi karega).
+GUARDIAN_SYMBOL = "XAUTUSD"
+
+
 def auto_tp_sl_guardian():
     while True:
         try:
@@ -5066,9 +5071,11 @@ def auto_tp_sl_guardian():
             if not positions_response or not positions_response.get('success'):
                 continue
 
+            # ★ CHANGE: sirf GUARDIAN_SYMBOL ki positions guard hongi, baaki ignore
             active_positions = [
                 p for p in positions_response.get('result', [])
                 if abs(float(p.get('size', 0))) > 0.0001
+                and (p.get("product_symbol") or p.get("symbol")) == GUARDIAN_SYMBOL
             ]
 
             if not active_positions:
@@ -5105,6 +5112,10 @@ def auto_tp_sl_guardian():
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
 
+                    # ★ CHANGE: double safety — galat symbol aaye to turant skip
+                    if symbol != GUARDIAN_SYMBOL:
+                        continue
+
                     pos_key = str(product_id)
 
                     if size > 0:
@@ -5113,8 +5124,6 @@ def auto_tp_sl_guardian():
                     else:
                         expected_tp = entry * (1 - live_tp_pct / 100)
                         expected_sl = entry * (1 + live_sl_pct / 100)
-
-                    
 
                     expected_tp = round_price_2dp(expected_tp)
                     expected_sl = round_price_2dp(expected_sl)
@@ -5155,19 +5164,6 @@ def auto_tp_sl_guardian():
 
                     if be_enabled and not be_already_done:
                         try:
-                            # ═══════════════════════════════════════════════
-                            # FIX: REST FIRST (reliable, fresh), WS = backup only
-                            #
-                            # NOTE: To check if WS mark_price is truly live, add this
-                            # snippet inside _ws_on_message() in the `if msg_type == 'mark_price':`
-                            # block (right after the price is parsed), it prints every WS tick:
-                            #
-                            #   log_system(f"[WS-MARK-TICK] {sym} = {price} @ {datetime.now().strftime('%H:%M:%S.%f')}")
-                            #
-                            # If you see this line printing every 1-2 seconds in trade.log for
-                            # ETHUSD, WS mark price IS live. If it's missing/rare, WS is NOT
-                            # reliably feeding price and you should rely on the REST fetch below.
-                            # ═══════════════════════════════════════════════
                             live_price = None
                             try:
                                 ticker_be = make_api_request('GET', f'/tickers/{symbol}')
@@ -5196,8 +5192,6 @@ def auto_tp_sl_guardian():
                                     be_trigger    = round_price_2dp(entry + half_distance - be_trig_buf)
                                     be_new_sl     = round_price_2dp(entry + be_profit_off)
 
-                                    # DEBUG LOG — throttled to once per 10s per position (FIX: was
-                                    # logging every 2s forever -> disk growth over many days)
                                     log_throttled(
                                         log_system, f"be_debug_long_{pos_key}",
                                         f"[BE DEBUG] {symbol} LONG | live={live_price:.4f} | "
@@ -5221,7 +5215,6 @@ def auto_tp_sl_guardian():
                                     be_trigger    = round_price_2dp(entry - half_distance + be_trig_buf)
                                     be_new_sl     = round_price_2dp(entry - be_profit_off)
 
-                                    # DEBUG LOG — throttled (see note above)
                                     log_throttled(
                                         log_system, f"be_debug_short_{pos_key}",
                                         f"[BE DEBUG] {symbol} SHORT | live={live_price:.4f} | "
@@ -5247,8 +5240,6 @@ def auto_tp_sl_guardian():
 
                     # ── TP/SL existence check ─────────────────────────────
                     # Stop TP/SL on Delta sit in state=pending until triggered.
-                    # Old query used state=open only → guardian never saw brackets,
-                    # thought they were missing, then silent-failed on re-place.
                     dynamic_tolerance = entry * 0.0005
 
                     orders_response = make_api_request(
