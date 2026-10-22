@@ -367,7 +367,7 @@ PRODUCT_IDS = {
 #     "XAUTUSD": 181689,
 # }
 
-fees=2
+fees=1
 
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
@@ -4276,13 +4276,24 @@ def _ss_pnl_group_orders(fills):
     return order_groups
 
 
+# def _ss_pnl_formula(entry_side, entry_price, exit_price, lot_size, symbol):
+#     """Same PnL formula as trading engine (info-only copy — does not call fill helpers)."""
+#     lot_multiplier = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+#     actual_quantity = float(lot_size) * float(lot_multiplier)
+#     if entry_side == 'buy':
+#         return (exit_price - (entry_price + fees)) * actual_quantity
+#     return ((entry_price - fees) - exit_price) * actual_quantity
+
 def _ss_pnl_formula(entry_side, entry_price, exit_price, lot_size, symbol):
     """Same PnL formula as trading engine (info-only copy — does not call fill helpers)."""
     lot_multiplier = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
     actual_quantity = float(lot_size) * float(lot_multiplier)
     if entry_side == 'buy':
-        return (exit_price - (entry_price + fees)) * actual_quantity
-    return ((entry_price - fees) - exit_price) * actual_quantity
+        gross = float(exit_price) - float(entry_price)
+    else:
+        gross = float(entry_price) - float(exit_price)
+    # `fees` = round-trip fee per lot (entry + exit), set from UI Trading Fees
+    return (gross - float(fees)) * actual_quantity
 
 
 def _ss_pnl_find_exit_for_entry(order_groups, entry_oid):
