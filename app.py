@@ -349,13 +349,25 @@ def cleanup_old_trades(target_size_mb=8.5):
 
 # API Configuration
 # Production:
-# BASE_URL = "https://api.india.delta.exchange"
-# WS_URL = "wss://socket.india.delta.exchange"
-# Testnet (demo):
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-WS_URL = "wss://socket-ind.testnet.deltaex.org"
+BASE_URL = "https://api.india.delta.exchange"
+WS_URL = "wss://socket.india.delta.exchange"
+# Testnet (demo) — if you switch back, also swap PRODUCT_IDS below:
+# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+# WS_URL = "wss://socket-ind.testnet.deltaex.org"
 
-fees=3.5
+# ★ Product IDs — change here when switching env
+# Production (api.india.delta.exchange):
+PRODUCT_IDS = {
+    "PAXGUSD": 123006,   # PAX Gold
+    "XAUTUSD": 131253,   # Tether Gold
+}
+# Testnet (cdn-ind.testnet.deltaex.org):
+# PRODUCT_IDS = {
+#     "PAXGUSD": 169532,
+#     "XAUTUSD": 181689,
+# }
+
+fees=2
 
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
@@ -379,7 +391,7 @@ def build_lot_steps(start_lot, streak):
     n_steps = int(streak)
     steps = {}
     for n in range(1, n_steps + 1):
-        val = start * (2 ** (n - 1))
+        val = start * (4 ** (n - 1))
         steps[n] = int(val) if float(val).is_integer() else val
     return steps
 
@@ -489,7 +501,7 @@ BOT_STATE = {
     'sl_percent': 2,
     'max_steps': max(LOT_STEPS.keys()),
     'last_result': None,
-    'symbol': 'ETHUSD',
+   'symbol': 'PAXGUSD',
     'stop_at_win': False,
     'stop_at_max_step': False,
     'force_stop': False,
@@ -501,7 +513,7 @@ BOT_STATE = {
 
 # Bot UI config (symbol, leverage, TP/SL) — persists in MySQL, survives refresh/restart
 BOT_CONFIG_DEFAULTS = {
-    'symbol': 'ETHUSD',
+    'symbol': 'PAXGUSD',
     'leverage': 100,
     'tp_percent': 2.0,
     'sl_percent': 1.0,
@@ -560,10 +572,17 @@ def load_bot_config_from_db():
             return False
 
         saved = json.loads(result['state_value'])
-        BOT_STATE['symbol'] = str(saved.get('symbol', BOT_CONFIG_DEFAULTS['symbol'])).upper()
+        allowed = {'PAXGUSD', 'XAUTUSD'}
+        loaded_symbol = str(saved.get('symbol', BOT_CONFIG_DEFAULTS['symbol'])).upper()
+        if loaded_symbol not in allowed:
+            log_system(f"Migrating removed symbol {loaded_symbol} → PAXGUSD")
+            loaded_symbol = 'PAXGUSD'
+        BOT_STATE['symbol'] = loaded_symbol
         BOT_STATE['leverage'] = int(saved.get('leverage', BOT_CONFIG_DEFAULTS['leverage']))
         BOT_STATE['tp_percent'] = float(saved.get('tp_percent', BOT_CONFIG_DEFAULTS['tp_percent']))
         BOT_STATE['sl_percent'] = float(saved.get('sl_percent', BOT_CONFIG_DEFAULTS['sl_percent']))
+        if loaded_symbol != str(saved.get('symbol', '')).upper():
+            save_bot_config_to_db(get_bot_config())
         log_system(
             f"BOT CONFIG LOADED | {BOT_STATE['symbol']} lev={BOT_STATE['leverage']}x "
             f"TP={BOT_STATE['tp_percent']}% SL={BOT_STATE['sl_percent']}%"
@@ -582,15 +601,15 @@ def apply_bot_config(data: dict):
         tp_percent = float(data.get('tp_percent', BOT_STATE['tp_percent']))
         sl_percent = float(data.get('sl_percent', BOT_STATE['sl_percent']))
 
-        valid_symbols = ['ETHUSD']
+        valid_symbols = ['PAXGUSD', 'XAUTUSD']
         if symbol not in valid_symbols:
             return False, f'Invalid symbol. Valid: {valid_symbols}'
         if leverage < 1 or leverage > 200:
             return False, 'Leverage must be integer between 1-200'
-        if not (0.1 <= tp_percent <= 50):
-            return False, 'TP percent must be between 0.1-50'
-        if not (0.1 <= sl_percent <= 50):
-            return False, 'SL percent must be between 0.1-50'
+        if not (0.01 <= tp_percent <= 50):
+            return False, 'TP percent must be between 0.01-50'
+        if not (0.01 <= sl_percent <= 50):
+            return False, 'SL percent must be between 0.01-50'
 
         BOT_STATE['symbol'] = symbol
         BOT_STATE['leverage'] = leverage
@@ -602,9 +621,7 @@ def apply_bot_config(data: dict):
         return False, f'Invalid values: {e}'
 
 
-LOT_SIZES = {
-    'ETHUSD': 0.01,
-}
+LOT_SIZES = {}
 LOT_SIZE_DEFAULT = 1
 
 LAST_TRADE_RESULT = {
@@ -1605,6 +1622,10 @@ def get_product_id(symbol):
     global PRODUCT_ID_CACHE
     if symbol in PRODUCT_ID_CACHE:
         return PRODUCT_ID_CACHE[symbol]
+    # Prefer hardcoded map (fast + correct for current BASE_URL env)
+    if symbol in PRODUCT_IDS:
+        PRODUCT_ID_CACHE[symbol] = PRODUCT_IDS[symbol]
+        return PRODUCT_IDS[symbol]
     try:
         products = make_api_request('GET', '/products')
         if not products or not products.get('result'):
@@ -1739,8 +1760,12 @@ def make_api_request(method, endpoint, data=None):
             try:
                 err_body = response.json()
             except Exception:
-                err_body = response.text
+                err_body = {'success': False, 'error': {'code': 'http_error', 'message': str(response.text)}}
             log_error(f"API HTTP {response.status_code} | {method} {endpoint} | {err_body}")
+            # Return body so callers can read error.code (e.g. invalid_contract)
+            if isinstance(err_body, dict):
+                err_body.setdefault('success', False)
+                return err_body
             return None
     except requests.exceptions.Timeout:
         log_error(f"API TIMEOUT | {method} {endpoint}")
@@ -2553,7 +2578,7 @@ def _ws_on_message(ws, message):
         if msg_type == 'success' and msg.get('message') == 'Authenticated':
             WS_AUTHENTICATED = True
             print("[WS] Authenticated successfully")
-            symbol = BOT_STATE.get('symbol', 'ETHUSD')
+            symbol = BOT_STATE.get('symbol', 'PAXGUSD')
             _ws_subscribe(ws, 'v2/user_trades', [symbol])
             _ws_subscribe(ws, 'positions',      [symbol])
             # FIX: track which symbol WS is currently subscribed to, so
@@ -2569,8 +2594,8 @@ def _ws_on_message(ws, message):
 
         # ADDED: mark price update handler — this whole block was missing
         if msg_type == 'mark_price':
-            raw_sym = msg.get('symbol', '')        # e.g. "MARK:ETHUSD"
-            sym     = raw_sym.replace('MARK:', '') # → "ETHUSD"
+            raw_sym = msg.get('symbol', '')        # e.g. "MARK:PAXGUSD"
+            sym     = raw_sym.replace('MARK:', '') # → "PAXGUSD"
             price   = msg.get('price') or msg.get('mark_price')
             if sym and price:
                 with MARK_PRICES_LOCK:
@@ -3411,12 +3436,10 @@ def calculate_next_lot():
 
 def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
     try:
+        # Tick + product_id from PRODUCT_IDS (set near BASE_URL at top of app.py)
         PRODUCT_CONFIG = {
-            "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
-            "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-        
-            #  "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
-            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+            "PAXGUSD": {"id": PRODUCT_IDS["PAXGUSD"], "tick": Decimal("0.01")},
+            "XAUTUSD": {"id": PRODUCT_IDS["XAUTUSD"], "tick": Decimal("0.01")},
         }
 
         config = PRODUCT_CONFIG.get(symbol)
@@ -3424,8 +3447,30 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
             log_error(f"Symbol {symbol} not in config!")
             return None
 
-        p_id = config["id"]
         tick = config["tick"]
+        p_id = config["id"] or get_product_id(symbol)
+        if not p_id:
+            log_error(f"Could not resolve product_id for {symbol}")
+            return None
+
+        # Re-apply leverage every order
+        lev = max(1, int(leverage or 1))
+        lev_resp = set_leverage(symbol, lev)
+        if not lev_resp or not lev_resp.get('success'):
+            log_error(f"set_leverage failed before order | lev={lev}x | resp={lev_resp}")
+
+        # At Nx leverage, liquidation is ~ (100/N)% away.
+        # Keep SL inside ~70% of that distance so bracket isn't past liq.
+        liq_dist_pct = 100.0 / lev
+        max_safe_sl = max(0.05, liq_dist_pct * 0.70)
+        used_sl_pct = float(sl_pct)
+        used_tp_pct = float(tp_pct)
+        if used_sl_pct > max_safe_sl:
+            log_system(
+                f"SL CLAMP | requested SL={used_sl_pct}% > safe max {max_safe_sl:.3f}% "
+                f"at {lev}x (liq≈{liq_dist_pct:.3f}%) → using {max_safe_sl:.3f}%"
+            )
+            used_sl_pct = max_safe_sl
 
         ticker = make_api_request('GET', f'/tickers/{symbol}')
         if not ticker or not ticker.get('result'):
@@ -3439,39 +3484,41 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
             d = Decimal(str(val))
             return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
 
-        base_dec = to_tick(mark_price)
+        def calc_tp_sl(entry_px):
+            base = to_tick(entry_px)
+            if side == 'buy':
+                tp = to_tick(entry_px * (1 + used_tp_pct / 100))
+                sl = to_tick(entry_px * (1 - used_sl_pct / 100))
+            else:
+                tp = to_tick(entry_px * (1 - used_tp_pct / 100))
+                sl = to_tick(entry_px * (1 + used_sl_pct / 100))
+            min_gap = tick * Decimal("3")
+            if side == 'buy':
+                if tp <= base: tp = base + min_gap
+                if sl >= base: sl = base - min_gap
+            else:
+                if tp >= base: tp = base - min_gap
+                if sl <= base: sl = base + min_gap
+            return str(tp), str(sl)
 
-        if side == 'buy':
-            tp_dec = to_tick(mark_price * (1 + tp_pct / 100))
-            sl_dec = to_tick(mark_price * (1 - sl_pct / 100))
-        else:
-            tp_dec = to_tick(mark_price * (1 - tp_pct / 100))
-            sl_dec = to_tick(mark_price * (1 + sl_pct / 100))
+        tp_price, sl_price = calc_tp_sl(mark_price)
 
-        MIN_TICKS = Decimal("3")
-        min_gap   = tick * MIN_TICKS
-
-        if side == 'buy':
-            if tp_dec <= base_dec: tp_dec = base_dec + min_gap
-            if sl_dec >= base_dec: sl_dec = base_dec - min_gap
-        else:
-            if tp_dec >= base_dec: tp_dec = base_dec - min_gap
-            if sl_dec <= base_dec: sl_dec = base_dec + min_gap
-
-        tp_price = str(tp_dec)
-        sl_price = str(sl_dec)
-
+        # XAUT/PAXG testnet: show_bracket_orders=False — sending bracket_* on
+        # the entry order returns invalid_contract. Place naked market first,
+        # then attach TP/SL via /orders/bracket after fill.
         order_data = {
-            "product_id"                    : p_id,
-            "side"                          : side,
-            "order_type"                    : "market_order",
-            "size"                          : int(size),
-            "bracket_take_profit_price"     : tp_price,
-            "bracket_take_profit_order_type": "market_order",
-            "bracket_stop_loss_price"       : sl_price,
-            "bracket_stop_loss_order_type"  : "market_order",
-            "bracket_stop_trigger_method"   : "mark_price",
+            "product_id": int(p_id),
+            "product_symbol": symbol,
+            "side": side,
+            "order_type": "market_order",
+            "size": int(size),
         }
+
+        log_system(
+            f"ORDER ATTEMPT | {symbol} {side.upper()} size={size} lev={lev}x "
+            f"product_id={p_id} mark={mark_price} "
+            f"(brackets after fill) TP={tp_price} ({used_tp_pct}%) SL={sl_price} ({used_sl_pct}%)"
+        )
 
         response = make_api_request('POST', '/orders', order_data)
 
@@ -3484,36 +3531,25 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
             )
             log_trade(f"ORDER PLACED | {side.upper()} | Lot={size} | Entry={actual_entry} | OrderID={oid}")
 
-            if actual_entry != mark_price:
-                actual_base = to_tick(actual_entry)
-                if side == 'buy':
-                    tp_dec = to_tick(actual_entry * (1 + tp_pct / 100))
-                    sl_dec = to_tick(actual_entry * (1 - sl_pct / 100))
-                else:
-                    tp_dec = to_tick(actual_entry * (1 - tp_pct / 100))
-                    sl_dec = to_tick(actual_entry * (1 + sl_pct / 100))
-
-                if side == 'buy':
-                    if tp_dec <= actual_base: tp_dec = actual_base + min_gap
-                    if sl_dec >= actual_base: sl_dec = actual_base - min_gap
-                else:
-                    if tp_dec >= actual_base: tp_dec = actual_base - min_gap
-                    if sl_dec <= actual_base: sl_dec = actual_base + min_gap
-
-                tp_price = str(tp_dec)
-                sl_price = str(sl_dec)
-
-            if not response['result'].get('bracket_orders', []):
-                bracket_payload = {
-                    "product_id": p_id,
-                    "take_profit_order": {"order_type": "market_order", "stop_price": tp_price},
-                    "stop_loss_order": {"order_type": "market_order", "stop_price": sl_price},
-                    "bracket_stop_trigger_method": "mark_price"
-                }
-                make_api_request('POST', '/orders/bracket', bracket_payload)
+            tp_price, sl_price = calc_tp_sl(actual_entry)
+            bracket_payload = {
+                "product_id": int(p_id),
+                "product_symbol": symbol,
+                "take_profit_order": {"order_type": "market_order", "stop_price": tp_price},
+                "stop_loss_order": {"order_type": "market_order", "stop_price": sl_price},
+                "bracket_stop_trigger_method": "mark_price",
+            }
+            br = make_api_request('POST', '/orders/bracket', bracket_payload)
+            if not br or not br.get('success'):
+                log_error(f"Bracket attach failed after fill | {br}")
+            else:
+                log_system(f"Bracket attached | TP={tp_price} SL={sl_price}")
         else:
             err = response.get('error') if response else 'No response'
-            log_error(f"ORDER FAILED: {err}")
+            log_error(
+                f"ORDER FAILED: {err} | product_id={p_id} lev={lev}x "
+                f"liq≈{liq_dist_pct:.2f}% SL={used_sl_pct}%"
+            )
 
         return response
 
@@ -3721,7 +3757,7 @@ def start_bot():
         leverage   = data.get('leverage', 10)
         tp_percent = data.get('tp_percent', 2.0)
         sl_percent = data.get('sl_percent', 1.0)
-        symbol     = data.get('symbol', 'ADAUSD')
+        symbol     = data.get('symbol', 'PAXGUSD')
         strategy_bot = str(data.get('strategy_bot') or data.get('bot_id') or 'bot1').strip().lower()
 
         # Load ONLY the chosen strategy file into RAM (others stay unloaded)
@@ -3742,19 +3778,22 @@ def start_bot():
 
         if not isinstance(leverage, int) or leverage < 1 or leverage > 200:
             return jsonify({'success': False, 'message': 'Leverage must be integer between 1-200'}), 400
-        if not isinstance(tp_percent, (int, float)) or tp_percent < 0.1 or tp_percent > 50:
-            return jsonify({'success': False, 'message': 'TP percent must be between 0.1-50'}), 400
-        if not isinstance(sl_percent, (int, float)) or sl_percent < 0.1 or sl_percent > 50:
-            return jsonify({'success': False, 'message': 'SL percent must be between 0.1-50'}), 400
+        if not isinstance(tp_percent, (int, float)) or tp_percent < 0.01 or tp_percent > 50:
+            return jsonify({'success': False, 'message': 'TP percent must be between 0.01-50'}), 400
+        if not isinstance(sl_percent, (int, float)) or sl_percent < 0.01 or sl_percent > 50:
+            return jsonify({'success': False, 'message': 'SL percent must be between 0.01-50'}), 400
         if not isinstance(symbol, str) or len(symbol) < 1 or len(symbol) > 20:
             return jsonify({'success': False, 'message': 'Symbol must be string between 1-20 characters'}), 400
+        symbol = symbol.upper()
+        if symbol not in ('PAXGUSD', 'XAUTUSD'):
+            return jsonify({'success': False, 'message': 'Invalid symbol. Valid: [\'PAXGUSD\', \'XAUTUSD\']'}), 400
 
         BOT_STATE['leverage']   = leverage
         BOT_STATE['tp_percent'] = float(tp_percent)
         BOT_STATE['sl_percent'] = float(sl_percent)
         BOT_STATE['max_steps']  = max_steps
         BOT_STATE['base_lot']   = LOT_STEPS[1]
-        BOT_STATE['symbol']     = symbol.upper()
+        BOT_STATE['symbol']     = symbol
         save_bot_config_to_db(get_bot_config())
 
         # FIX: make sure WS engine is (re)subscribed to THIS symbol before
@@ -3860,7 +3899,7 @@ def update_symbol():
         new_symbol = data.get('symbol')
         if not new_symbol:
             return jsonify({'success': False, 'message': 'Symbol is required'}), 400
-        valid_symbols = ['ETHUSD']
+        valid_symbols = ['PAXGUSD', 'XAUTUSD']
         if new_symbol not in valid_symbols:
             return jsonify({'success': False, 'message': f'Invalid symbol. Valid: {valid_symbols}'}), 400
         old_symbol          = BOT_STATE['symbol']
@@ -4642,7 +4681,7 @@ def apply_decision_tf_config(data: dict):
 def _configure_bot_runtime():
     """Give strategy bots access to app helpers without importing app.py."""
     bot_manager.set_runtime_factory(lambda: {
-        'get_symbol': lambda: BOT_STATE.get('symbol', 'ETHUSD'),
+        'get_symbol': lambda: BOT_STATE.get('symbol', 'PAXGUSD'),
         'make_api_request': make_api_request,
         'get_decision_tf_config': get_decision_tf_config,
         'decision_tf_priority': DECISION_TF_PRIORITY,
@@ -4815,10 +4854,10 @@ def apply_guardian_config(data: dict):
         else:
             rev = bool(rev)
 
-        if not (0.1 <= tp <= 50):
-            return False, 'TP % must be between 0.1 and 50'
-        if not (0.1 <= sl <= 50):
-            return False, 'SL % must be between 0.1 and 50'
+        if not (0.01 <= tp <= 50):
+            return False, 'TP % must be between 0.01 and 50'
+        if not (0.01 <= sl <= 50):
+            return False, 'SL % must be between 0.01 and 50'
         if liq not in ('Y', 'N'):
             return False, 'Liquidation protection must be Y or N'
         if not (0 <= liq_buf <= 50):
