@@ -360,11 +360,13 @@ WS_URL = "wss://socket.india.delta.exchange"
 PRODUCT_IDS = {
     "PAXGUSD": 123006,   # PAX Gold
     "XAUTUSD": 131253,   # Tether Gold
+    "ADAUSD": 16614,     # Cardano
 }
 # Testnet (cdn-ind.testnet.deltaex.org):
 # PRODUCT_IDS = {
 #     "PAXGUSD": 169532,
 #     "XAUTUSD": 181689,
+#     "ADAUSD": 101760,
 # }
 
 fees=1
@@ -572,7 +574,7 @@ def load_bot_config_from_db():
             return False
 
         saved = json.loads(result['state_value'])
-        allowed = {'PAXGUSD', 'XAUTUSD'}
+        allowed = {'PAXGUSD', 'XAUTUSD', 'ADAUSD'}
         loaded_symbol = str(saved.get('symbol', BOT_CONFIG_DEFAULTS['symbol'])).upper()
         if loaded_symbol not in allowed:
             log_system(f"Migrating removed symbol {loaded_symbol} → PAXGUSD")
@@ -601,7 +603,7 @@ def apply_bot_config(data: dict):
         tp_percent = float(data.get('tp_percent', BOT_STATE['tp_percent']))
         sl_percent = float(data.get('sl_percent', BOT_STATE['sl_percent']))
 
-        valid_symbols = ['PAXGUSD', 'XAUTUSD']
+        valid_symbols = ['PAXGUSD', 'XAUTUSD', 'ADAUSD']
         if symbol not in valid_symbols:
             return False, f'Invalid symbol. Valid: {valid_symbols}'
         if leverage < 1 or leverage > 200:
@@ -3440,6 +3442,7 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         PRODUCT_CONFIG = {
             "PAXGUSD": {"id": PRODUCT_IDS["PAXGUSD"], "tick": Decimal("0.01")},
             "XAUTUSD": {"id": PRODUCT_IDS["XAUTUSD"], "tick": Decimal("0.01")},
+            "ADAUSD": {"id": PRODUCT_IDS["ADAUSD"], "tick": Decimal("0.00001")},
         }
 
         config = PRODUCT_CONFIG.get(symbol)
@@ -3785,8 +3788,8 @@ def start_bot():
         if not isinstance(symbol, str) or len(symbol) < 1 or len(symbol) > 20:
             return jsonify({'success': False, 'message': 'Symbol must be string between 1-20 characters'}), 400
         symbol = symbol.upper()
-        if symbol not in ('PAXGUSD', 'XAUTUSD'):
-            return jsonify({'success': False, 'message': 'Invalid symbol. Valid: [\'PAXGUSD\', \'XAUTUSD\']'}), 400
+        if symbol not in ('PAXGUSD', 'XAUTUSD', 'ADAUSD'):
+            return jsonify({'success': False, 'message': 'Invalid symbol. Valid: [\'PAXGUSD\', \'XAUTUSD\', \'ADAUSD\']'}), 400
 
         BOT_STATE['leverage']   = leverage
         BOT_STATE['tp_percent'] = float(tp_percent)
@@ -3899,7 +3902,7 @@ def update_symbol():
         new_symbol = data.get('symbol')
         if not new_symbol:
             return jsonify({'success': False, 'message': 'Symbol is required'}), 400
-        valid_symbols = ['PAXGUSD', 'XAUTUSD']
+        valid_symbols = ['PAXGUSD', 'XAUTUSD', 'ADAUSD']
         if new_symbol not in valid_symbols:
             return jsonify({'success': False, 'message': f'Invalid symbol. Valid: {valid_symbols}'}), 400
         old_symbol          = BOT_STATE['symbol']
