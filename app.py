@@ -252,26 +252,65 @@ LAST_SAVED_TRADE_KEY = None
 # )
 
 
-MYSQL_POOL = PooledDB(
-    creator=pymysql,
-    maxconnections=4,       # stay safely under server limit of 5
-    mincached=1,
-    maxcached=4,
-    maxshared=0,
-    blocking=True,          # wait for a free connection instead of erroring
-    maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
-    setsession=[],
-    ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
-    host=os.getenv('MYSQL_HOST', 'bqebck7vtzt0e6ugzqsf-mysql.services.clever-cloud.com'),
-    port=int(os.getenv('MYSQL_PORT', 3306)),
-    user=os.getenv('MYSQL_USER', 'uihxwgphvyf5bhxa'),
-    password=os.getenv('MYSQL_PASSWORD', 'oCPY54FrSIHfMBHgVBrx'),
-    database=os.getenv('MYSQL_DB', 'bqebck7vtzt0e6ugzqsf'),
-    charset='utf8mb4',
-    cursorclass=pymysql.cursors.DictCursor,
-    autocommit=False,
-    ssl={}
-)
+def _mysql_pool_kwargs():
+    return dict(
+        creator=pymysql,
+        # Clever Cloud free MySQL की सीट = 5 connections (सारे क्लाइंट मिलाकर)।
+        # 2 काफ़ी हैं: execute_mysql_query हर query के बाद connection pool को
+        # लौटा देता है, इसलिए 3 threads (bot loop + WS + guardian) भी share कर
+        # सकते हैं। पुराना 4/4 setting zombie sessions के साथ startup.crash करा
+        # देता था: (1226, "has exceeded the 'max_user_connections'").
+        maxconnections=2,
+        mincached=0,          # import पर कोई connection मत खोलो — on-demand
+        maxcached=2,
+        maxshared=0,
+        blocking=True,        # slot खाली होने का इंतज़ार करो, error मत दो
+        maxusage=None,
+        ping=1,               # use से पहले ping; stale हो तो reconnect
+        host=os.getenv('MYSQL_HOST', 'bqebck7vtzt0e6ugzqsf-mysql.services.clever-cloud.com'),
+        port=int(os.getenv('MYSQL_PORT', 3306)),
+        user=os.getenv('MYSQL_USER', 'uihxwgphvyf5bhxa'),
+        password=os.getenv('MYSQL_PASSWORD', 'oCPY54FrSIHfMBHgVBrx'),
+        database=os.getenv('MYSQL_DB', 'bqebck7vtzt0e6ugzqsf'),
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+        ssl={}
+    )
+
+
+def _build_mysql_pool(attempts=5, delay=3.0):
+    """
+    1226 (max_user_connections) आने पर थोड़ा रुककर retry — आमतौर पर ये slots
+    पुराने/killed runs या IP बदलने के बाद बचे zombie sessions पकड़े रहते हैं।
+    setsession का wait_timeout हर नए session को 3 min idle होने पर server से
+    ख़ुद मार देता है, ताकि zombie slots अटके न रहें।
+    """
+    base = _mysql_pool_kwargs()
+    with_timeout = dict(base, setsession=[
+        'SET SESSION wait_timeout=180',
+        'SET SESSION interactive_timeout=180',
+    ])
+    last_err = None
+    for i in range(attempts):
+        try:
+            return PooledDB(**with_timeout)
+        except Exception as e:
+            last_err = e
+            if 'max_user_connections' not in str(e):
+                # server SET SESSION allow न करे तो बिना timeout के try करो
+                try:
+                    return PooledDB(**dict(base, setsession=[]))
+                except Exception as e2:
+                    if 'max_user_connections' not in str(e2):
+                        raise
+                    last_err = e2
+            print(f"⚠️ MySQL slots full (limit 5) — retry {i + 1}/{attempts} in {delay:.0f}s | {e}")
+            time.sleep(delay)
+    raise last_err
+
+
+MYSQL_POOL = _build_mysql_pool()
 
 
 def get_mysql_connection():
@@ -393,7 +432,7 @@ def build_lot_steps(start_lot, streak):
     n_steps = int(streak)
     steps = {}
     for n in range(1, n_steps + 1):
-        val = start * (4 ** (n - 1))
+        val = start * (3 ** (n - 1))
         steps[n] = int(val) if float(val).is_integer() else val
     return steps
 
@@ -3495,6 +3534,67 @@ def calculate_next_lot():
         LOT_CALCULATION_LOCK = False
 
 
+def live_mark_price(symbol):
+    t = make_api_request('GET', f'/tickers/{symbol}')
+    if t and t.get('result'):
+        try:
+            return float(t['result'].get('mark_price') or t['result'].get('close'))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def place_bracket_leg(symbol, product_id, leg_key, price, side, live_px=None, max_tries=3):
+    """
+    TP/SL की एक-एक leg अलग से /orders/bracket पर भेजता है।
+
+    पहले दोनों legs एक ही combined payload में जाते थे — ADAUSD में entry mark से
+    ~0.06% ऊपर fill हुआ, TP live price के "अंदर" चला गया और exchange ने पूरा
+    bracket_order_immediate_execution से reject कर दिया, जिससे SL भी नहीं लगा
+    (position 100x पर naked रह गई)।
+
+    यहाँ जो leg live mark के गलत तरफ़ है, उसे mark से बढ़ते हुए ticks (1, 2, 3)
+    बाहर खिसकाकर दोबारा भेजा जाता है — ताकि position कभी stop के बिना न रहे।
+    Returns (ok, price_used, response).
+    """
+    tick = float(get_tick_size(symbol))
+    px = float(price)
+    resp = None
+
+    for attempt in range(max_tries):
+        payload = {
+            "product_id": int(product_id),
+            "product_symbol": symbol,
+            leg_key: {"order_type": "market_order", "stop_price": fmt_price(px, symbol)},
+            "bracket_stop_trigger_method": "mark_price",
+        }
+        resp = make_api_request('POST', '/orders/bracket', payload)
+        if resp and resp.get('success'):
+            return True, px, resp
+
+        err = (resp or {}).get('error') if isinstance(resp, dict) else None
+        code = err.get('code', '') if isinstance(err, dict) else str(err or '')
+        if 'immediate_execution' not in str(code):
+            return False, px, resp
+
+        # retry से पहले fresh mark लो — पुराना cached price ही reject का कारण
+        # था, उसी पर nudge करना फिर से reject करा देगा।
+        live_px = live_mark_price(symbol) or live_px
+        if not live_px:
+            return False, px, resp
+
+        # TP (long) / SL (short) ko live से ऊपर, SL (long) / TP (short) को नीचे होना चाहिए
+        must_be_above = (leg_key == 'take_profit_order') == (side == 'buy')
+        nudge = tick * (attempt + 1)
+        px = round_price_to_tick(live_px + nudge if must_be_above else live_px - nudge, symbol)
+        log_system(
+            f"[BRACKET NUDGE] {symbol} {leg_key} live={live_px} -> {fmt_price(px, symbol)} "
+            f"(try {attempt + 2}, leg was inside the live price)"
+        )
+
+    return False, px, resp
+
+
 def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
     try:
         # Tick size ab symbol-driven hai (ADAUSD 0.00001, gold 0.01) — product_id
@@ -3587,18 +3687,20 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
             log_trade(f"ORDER PLACED | {side.upper()} | Lot={size} | Entry={actual_entry} | OrderID={oid}")
 
             tp_price, sl_price = calc_tp_sl(actual_entry)
-            bracket_payload = {
-                "product_id": int(p_id),
-                "product_symbol": symbol,
-                "take_profit_order": {"order_type": "market_order", "stop_price": tp_price},
-                "stop_loss_order": {"order_type": "market_order", "stop_price": sl_price},
-                "bracket_stop_trigger_method": "mark_price",
-            }
-            br = make_api_request('POST', '/orders/bracket', bracket_payload)
-            if not br or not br.get('success'):
-                log_error(f"Bracket attach failed after fill | {br}")
-            else:
-                log_system(f"Bracket attached | TP={tp_price} SL={sl_price}")
+            # SL पहले — protection TP से ज़्यादा ज़रूरी है
+            sl_ok, sl_used, sl_resp = place_bracket_leg(
+                symbol, p_id, "stop_loss_order", sl_price, side, mark_price)
+            if not sl_ok:
+                log_error(f"SL attach failed after fill | {sl_resp}")
+            tp_ok, tp_used, tp_resp = place_bracket_leg(
+                symbol, p_id, "take_profit_order", tp_price, side, mark_price)
+            if not tp_ok:
+                log_error(f"TP attach failed after fill | {tp_resp}")
+            if sl_ok and tp_ok:
+                log_system(
+                    f"Bracket attached | TP={fmt_price(tp_used, symbol)} "
+                    f"SL={fmt_price(sl_used, symbol)}"
+                )
         else:
             err = response.get('error') if response else 'No response'
             log_error(
@@ -5546,76 +5648,33 @@ def auto_tp_sl_guardian():
                                 curr_price = float(ticker['result']['mark_price']
                                                    or ticker['result']['close'])
 
-                        # Per-leg safety: skip only the leg that would fire immediately
-                        place_tp = need_tp
-                        place_sl = need_sl
-                        if curr_price is not None:
-                            if size > 0:  # LONG
-                                if place_tp and expected_tp <= curr_price:
-                                    log_system(
-                                        f"[GUARDIAN] {symbol}: skip TP place — "
-                                        f"tp={expected_tp:.4f} <= live={curr_price:.4f}"
-                                    )
-                                    place_tp = False
-                                if place_sl and sl_target >= curr_price:
-                                    log_system(
-                                        f"[GUARDIAN] {symbol}: skip SL place — "
-                                        f"sl={sl_target:.4f} >= live={curr_price:.4f} "
-                                        f"(would trigger immediately)"
-                                    )
-                                    place_sl = False
-                            else:  # SHORT
-                                if place_tp and expected_tp >= curr_price:
-                                    log_system(
-                                        f"[GUARDIAN] {symbol}: skip TP place — "
-                                        f"tp={expected_tp:.4f} >= live={curr_price:.4f}"
-                                    )
-                                    place_tp = False
-                                if place_sl and sl_target <= curr_price:
-                                    log_system(
-                                        f"[GUARDIAN] {symbol}: skip SL place — "
-                                        f"sl={sl_target:.4f} <= live={curr_price:.4f} "
-                                        f"(would trigger immediately)"
-                                    )
-                                    place_sl = False
-
-                        if not place_tp and not place_sl:
+                        if not (need_tp or need_sl):
                             continue
 
-                        payload = {"product_id": int(product_id)}
-                        if place_tp:
-                            payload["take_profit_order"] = {
-                                "order_type": "market_order",
-                                "stop_price": fmt_price(expected_tp, symbol)
-                            }
-                        if place_sl:
-                            payload["stop_loss_order"] = {
-                                "order_type": "market_order",
-                                "stop_price": fmt_price(sl_target, symbol)
-                            }
-
-                        log_system(
-                            f"[GUARDIAN] Placing missing bracket for {symbol} | "
-                            f"tp={'Y' if place_tp else 'N'}@{expected_tp:.6f} "
-                            f"sl={'Y' if place_sl else 'N'}@{sl_target:.6f}"
-                        )
-                        body = json.dumps(payload)
-                        try:
-                            res = requests.post(
-                                BASE_URL + "/v2/orders/bracket",
-                                headers=sign_request("POST", "/v2/orders/bracket", body),
-                                data=body,
-                                timeout=10
-                            )
-                            if res.status_code == 200:
-                                log_system(f"[GUARDIAN] Bracket placed for {symbol}")
+                        # Legs अलग-अलग भेजे जाते हैं (SL पहले): combined payload में
+                        # एक leg live price के अंदर होने पर exchange पूरा bracket
+                        # reject कर देता था — तभी ADAUSD का TP लगा, SL नहीं।
+                        side = 'buy' if size > 0 else 'sell'
+                        if need_sl:
+                            sl_ok, sl_used, sl_resp = place_bracket_leg(
+                                symbol, product_id, "stop_loss_order", sl_target, side, curr_price)
+                            if sl_ok:
+                                log_system(f"[GUARDIAN] {symbol}: SL leg placed @ {fmt_price(sl_used, symbol)}")
                             else:
                                 log_system(
-                                    f"[GUARDIAN] Bracket place FAILED {symbol}: "
-                                    f"HTTP {res.status_code} {res.text[:300]}"
+                                    f"[GUARDIAN] {symbol}: SL leg FAILED @ {fmt_price(sl_used, symbol)} | "
+                                    f"{str(sl_resp)[:200]}"
                                 )
-                        except Exception as place_err:
-                            log_system(f"[GUARDIAN] Bracket place exception: {place_err}")
+                        if need_tp:
+                            tp_ok, tp_used, tp_resp = place_bracket_leg(
+                                symbol, product_id, "take_profit_order", expected_tp, side, curr_price)
+                            if tp_ok:
+                                log_system(f"[GUARDIAN] {symbol}: TP leg placed @ {fmt_price(tp_used, symbol)}")
+                            else:
+                                log_system(
+                                    f"[GUARDIAN] {symbol}: TP leg FAILED @ {fmt_price(tp_used, symbol)} | "
+                                    f"{str(tp_resp)[:200]}"
+                                )
 
                     time.sleep(0.3)
 
@@ -5694,33 +5753,23 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
 
     if not be_sl_set and not sl_orders_be:
         # No existing SL order — place fresh bracket SL
-        payload_be = {
-            "product_id": int(product_id),
-            "stop_loss_order": {
-                "order_type": "market_order",
-                "stop_price": fmt_price(be_new_sl, symbol)
-            }
-        }
-        body_be = json.dumps(payload_be)
-        try:
-            res_be = requests.post(
-                BASE_URL + "/v2/orders/bracket",
-                headers=sign_request("POST", "/v2/orders/bracket", body_be),
-                data=body_be,
-                timeout=10
+        side = 'buy' if size > 0 else 'sell'
+        ok, used, resp_be = place_bracket_leg(
+            symbol, product_id, "stop_loss_order", be_new_sl, side, live_price)
+        if ok:
+            log_system(
+                f"[BREAK-EVEN] {direction.upper()} {symbol}: "
+                f"New SL placed at {used:.6f}"
             )
-            if res_be.status_code == 200:
-                log_system(
-                    f"[BREAK-EVEN] {direction.upper()} {symbol}: "
-                    f"New SL placed at {be_new_sl:.6f}"
-                )
-                # CHANGE 1: True ki jagah be_new_sl price store karo
-                with _break_even_applied_lock:
-                    _break_even_applied[pos_key] = be_new_sl
-                    _positions_had_be_sl[pos_key] = be_new_sl
-                _mark_current_order_had_be(be_new_sl)
-        except Exception:
-            pass
+            with _break_even_applied_lock:
+                _break_even_applied[pos_key] = round_price_to_tick(used, symbol)
+                _positions_had_be_sl[pos_key] = round_price_to_tick(used, symbol)
+            _mark_current_order_had_be(round_price_to_tick(used, symbol))
+        else:
+            log_system(
+                f"[BREAK-EVEN] {direction.upper()} {symbol}: New SL place failed @ "
+                f"{used:.6f} | {str(resp_be)[:200]}"
+            )
 
 
 # ========== MAIN ==========
