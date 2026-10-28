@@ -836,13 +836,72 @@ def init_database():
         raise
 
 
-#decimals ke liye ek extra fuction
-def round_price_2dp(price):
+# ========== TICK-SIZE / DECIMAL AWARE PRICE HELPERS ==========
+# Delta ke products ki price tick_size alag-alag hai:
+#   XAUTUSD / PAXGUSD -> 0.01      (price ~4000)
+#   ADAUSD            -> 0.00001   (price ~0.20)
+# Isliye TP/SL ko 2 dp pe round karna ADAUSD ke liye galat tha:
+#   0.20350 ka 0.02% TP = 0.20354 -> "0.20" ban jaata tha (SL == TP == entry se neeche)
+# aur exchange bracket reject kar deta tha. Ab har symbol ki apni tick use hoti hai.
+TICK_SIZES = {
+    "PAXGUSD": Decimal("0.01"),
+    "XAUTUSD": Decimal("0.01"),
+    "ADAUSD": Decimal("0.00001"),
+}
+_tick_size_cache = {}
+
+
+def get_tick_size(symbol):
+    """Price tick for a symbol (Decimal). API se fetch + cache, fallback 0.01."""
+    sym = (symbol or "").upper()
+    if sym in TICK_SIZES:
+        return TICK_SIZES[sym]
+    if sym in _tick_size_cache:
+        return _tick_size_cache[sym]
+    tick = Decimal("0.01")
+    try:
+        p_id = get_product_id(sym)
+        if p_id:
+            resp = make_api_request('GET', f'/products/{p_id}')
+            raw = (resp or {}).get('result', {})
+            ts = raw.get('tick_size') if isinstance(raw, dict) else None
+            if ts:
+                candidate = Decimal(str(ts))
+                if candidate > 0:
+                    tick = candidate
+    except Exception as e:
+        log_error(f"get_tick_size fallback for {sym}: {e}")
+    _tick_size_cache[sym] = tick
+    return tick
+
+
+def tick_decimals(symbol):
+    """Number of decimal places implied by the symbol's tick size."""
+    exp = get_tick_size(symbol).as_tuple().exponent
+    return max(0, -int(exp)) if isinstance(exp, int) else 2
+
+
+def to_tick(price, symbol):
+    """Round a price to the symbol's tick grid (Decimal, exact)."""
+    tick = get_tick_size(symbol)
+    d = Decimal(str(price))
+    return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+
+
+def round_price_to_tick(price, symbol):
     """Only for TP/SL/bracket stop prices sent to exchange. NOT used for PnL math."""
     try:
-        return float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        return float(to_tick(price, symbol))
     except Exception:
-        return round(float(price), 2)
+        return float(price)
+
+
+def fmt_price(price, symbol):
+    """Exchange-facing stop_price string with the symbol's own decimal count."""
+    try:
+        return "{:.{d}f}".format(float(price), d=tick_decimals(symbol))
+    except Exception:
+        return str(price)
 
 # ========== PERSISTENT STATE FUNCTIONS ==========
 def save_bot_state_to_db():
@@ -3438,17 +3497,9 @@ def calculate_next_lot():
 
 def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
     try:
-        # Tick + product_id from PRODUCT_IDS (set near BASE_URL at top of app.py)
-        PRODUCT_CONFIG = {
-            "PAXGUSD": {"id": PRODUCT_IDS["PAXGUSD"], "tick": Decimal("0.01")},
-            "XAUTUSD": {"id": PRODUCT_IDS["XAUTUSD"], "tick": Decimal("0.01")},
-            "ADAUSD": {"id": PRODUCT_IDS["ADAUSD"], "tick": Decimal("0.00001")},
-        }
-
-        config = PRODUCT_CONFIG.get(symbol)
-        if not config:
-            log_error(f"Symbol {symbol} not in config!")
-            return None
+        # Tick size ab symbol-driven hai (ADAUSD 0.00001, gold 0.01) — product_id
+        # PRODUCT_IDS se aata hai.
+        config = {"id": PRODUCT_IDS.get(symbol), "tick": get_tick_size(symbol)}
 
         tick = config["tick"]
         p_id = config["id"] or get_product_id(symbol)
@@ -3483,26 +3534,27 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         result     = ticker['result']
         mark_price = float(result.get('mark_price') or result.get('close'))
 
-        def to_tick(val):
-            d = Decimal(str(val))
-            return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+        def to_tick_px(val):
+            return to_tick(val, symbol)
 
         def calc_tp_sl(entry_px):
-            base = to_tick(entry_px)
+            base = to_tick_px(entry_px)
             if side == 'buy':
-                tp = to_tick(entry_px * (1 + used_tp_pct / 100))
-                sl = to_tick(entry_px * (1 - used_sl_pct / 100))
+                tp = to_tick_px(entry_px * (1 + used_tp_pct / 100))
+                sl = to_tick_px(entry_px * (1 - used_sl_pct / 100))
             else:
-                tp = to_tick(entry_px * (1 - used_tp_pct / 100))
-                sl = to_tick(entry_px * (1 + used_sl_pct / 100))
-            min_gap = tick * Decimal("3")
+                tp = to_tick_px(entry_px * (1 - used_tp_pct / 100))
+                sl = to_tick_px(entry_px * (1 + used_sl_pct / 100))
+            # 1 tick hi minimum gap rakho — ADAUSD jaise low-priced symbol pe 0.01%
+            # TP khud ~2 ticks hota hai, 3-tick floor usse bada kar deta tha.
+            min_gap = tick
             if side == 'buy':
                 if tp <= base: tp = base + min_gap
                 if sl >= base: sl = base - min_gap
             else:
                 if tp >= base: tp = base - min_gap
                 if sl <= base: sl = base + min_gap
-            return str(tp), str(sl)
+            return fmt_price(tp, symbol), fmt_price(sl, symbol)
 
         tp_price, sl_price = calc_tp_sl(mark_price)
 
@@ -4942,7 +4994,7 @@ def _consume_order_had_be(entry_order_id):
         return _orders_had_be_sl.pop(str(entry_order_id), None) is not None
 
 
-def _exit_matches_be_sl(exit_price, be_sl_price, entry_price=None, side=None, tolerance=None):
+def _exit_matches_be_sl(exit_price, be_sl_price, entry_price=None, side=None, tolerance=None, symbol=None):
     """
     True only when fill exit is at/near the BE SL stop (not TP).
     BE SL = entry ± UI offset; TP is much farther — a TP fill must NOT match.
@@ -4956,9 +5008,12 @@ def _exit_matches_be_sl(exit_price, be_sl_price, entry_price=None, side=None, to
         return False
 
     if tolerance is None:
-        # Cover market-order slip on BE SL without reaching TP distance
+        # Cover market-order slip on BE SL without reaching TP distance.
+        # 2.0 ka floor gold (~4000) ke scale pe tha — ADAUSD (0.20) pe wo har
+        # exit ko BE SL se match kara deta. Relative 0.05% dono par sahi hai.
         ref = abs(be_sl) if be_sl else abs(exit_p)
-        tolerance = max(2.0, ref * 0.0005)
+        tick_floor = float(get_tick_size(symbol)) * 2 if symbol else 0.0
+        tolerance = max(tick_floor, ref * 0.0005)
 
     return abs(exit_p - be_sl) <= tolerance
 
@@ -4987,17 +5042,20 @@ def _resolve_be_retry_on_close(symbol, exit_price=None, entry_price=None, side=N
             _break_even_applied.pop(pid, None)
         if be_sl_price is None and entry_price is not None:
             try:
-                offset = float(gcfg.get('break_even_profit_offset', 0))
                 ep = float(entry_price)
+                # UI offset gold-scale USD me hai — chhote price wale symbol pe
+                # cap karke hi BE SL banta hai (guardian bhi yahi karta hai).
+                offset = min(float(gcfg.get('break_even_profit_offset', 0)), ep * 0.005)
+                offset = round_price_to_tick(offset, symbol)
                 side_l = (str(side).lower() if side else '')
                 if side_l == 'buy':
-                    be_sl_price = ep + offset
+                    be_sl_price = round_price_to_tick(ep + offset, symbol)
                 elif side_l == 'sell':
-                    be_sl_price = ep - offset
+                    be_sl_price = round_price_to_tick(ep - offset, symbol)
             except (TypeError, ValueError):
                 be_sl_price = None
 
-        matched = _exit_matches_be_sl(exit_price, be_sl_price, entry_price, side)
+        matched = _exit_matches_be_sl(exit_price, be_sl_price, entry_price, side, symbol=symbol)
         if matched:
             log_system(
                 f"[BE SL RETRY] {symbol}: exit={exit_price} matched BE SL={be_sl_price} "
@@ -5071,9 +5129,53 @@ def _handle_close_step_progression(symbol, pnl, exit_price=None, entry_price=Non
 #
 # Replace your existing auto_tp_sl_guardian function with this ENTIRE function.
 
-# ★ Guardian sirf isi ek market ke TP/SL/BE ko guard karega.
-# Baaki kisi bhi symbol ki position ko guardian bilkul ignore karega (touch nahi karega).
-GUARDIAN_SYMBOL = "XAUTUSD"
+# ★ Guardian in markets ke TP/SL/BE ko guard karega. Baaki symbols ki position
+# ko bilkul touch nahi karega. ADAUSD isliye add kiya kyunki uska price 0.20 ke
+# aas-paas (5 decimal) hai aur 2-dp rounding me uska TP/SL galat ho jaata tha.
+GUARDIAN_SYMBOLS = {"XAUTUSD", "ADAUSD"}
+
+
+def _be_targets(symbol, size, entry, expected_tp, tick, be_trig_pct, be_trig_buf, be_profit_off):
+    """
+    Return (be_trigger, be_new_sl) tick-rounded, or None when break-even cannot
+    fit between entry and TP.
+
+    UI ke BE offsets (trigger buffer, profit offset) USD me gold (~4000 price)
+    ke liye tune kiye hain. ADAUSD jaise 0.20-wale symbol pe 3.5 USD ka offset
+    entry se 17x door ho jaata hai — SL TP se bhi aage chala jaata aur stop
+    turant hit ho position close ho jaati. Isliye offsets ko TP distance ke
+    fraction aur entry ke chhote % se cap kiya jaata hai (gold pe result wahi
+    purana aata hai kyunki wahan cap binding nahi hota).
+    """
+    tp_distance = abs(expected_tp - entry)
+    if tp_distance <= 0:
+        return None
+    long_side = size > 0
+
+    offset = max(float(tick), min(float(be_profit_off), tp_distance * 0.4, entry * 0.005))
+    buffer = max(float(tick), min(float(be_trig_buf), tp_distance * 0.3, entry * 0.005))
+
+    if long_side:
+        be_trigger = round_price_to_tick(entry + tp_distance * be_trig_pct - buffer, symbol)
+        be_new_sl = round_price_to_tick(entry + offset, symbol)
+        # BE SL ko entry se upar aur TP ke neeche hi hona chahiye
+        if be_new_sl <= entry or be_new_sl >= expected_tp:
+            return None
+        if be_trigger >= expected_tp:
+            be_trigger = round_price_to_tick(expected_tp - tick, symbol)
+        if be_trigger <= entry:
+            be_trigger = round_price_to_tick(entry + tick, symbol)
+    else:
+        be_trigger = round_price_to_tick(entry - tp_distance * be_trig_pct + buffer, symbol)
+        be_new_sl = round_price_to_tick(entry - offset, symbol)
+        if be_new_sl >= entry or be_new_sl <= expected_tp:
+            return None
+        if be_trigger <= expected_tp:
+            be_trigger = round_price_to_tick(expected_tp + tick, symbol)
+        if be_trigger >= entry:
+            be_trigger = round_price_to_tick(entry - tick, symbol)
+
+    return be_trigger, be_new_sl
 
 
 def auto_tp_sl_guardian():
@@ -5085,11 +5187,11 @@ def auto_tp_sl_guardian():
             if not positions_response or not positions_response.get('success'):
                 continue
 
-            # ★ CHANGE: sirf GUARDIAN_SYMBOL ki positions guard hongi, baaki ignore
+            # ★ sirf GUARDIAN_SYMBOLS ki positions guard hongi, baaki ignore
             active_positions = [
                 p for p in positions_response.get('result', [])
                 if abs(float(p.get('size', 0))) > 0.0001
-                and (p.get("product_symbol") or p.get("symbol")) == GUARDIAN_SYMBOL
+                and (p.get("product_symbol") or p.get("symbol")) in GUARDIAN_SYMBOLS
             ]
 
             if not active_positions:
@@ -5126,11 +5228,12 @@ def auto_tp_sl_guardian():
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
 
-                    # ★ CHANGE: double safety — galat symbol aaye to turant skip
-                    if symbol != GUARDIAN_SYMBOL:
+                    # ★ double safety — galat symbol aaye to turant skip
+                    if symbol not in GUARDIAN_SYMBOLS:
                         continue
 
                     pos_key = str(product_id)
+                    tick = float(get_tick_size(symbol))
 
                     if size > 0:
                         expected_tp = entry * (1 + live_tp_pct / 100)
@@ -5139,12 +5242,25 @@ def auto_tp_sl_guardian():
                         expected_tp = entry * (1 - live_tp_pct / 100)
                         expected_sl = entry * (1 + live_sl_pct / 100)
 
-                    expected_tp = round_price_2dp(expected_tp)
-                    expected_sl = round_price_2dp(expected_sl)
+                    expected_tp = round_price_to_tick(expected_tp, symbol)
+                    expected_sl = round_price_to_tick(expected_sl, symbol)
+
+                    # Tiny % (0.01–0.02) tick se chhota ho jaaye to kam se kam
+                    # 1 tick doori rakho, warna TP == SL == entry ban jaata hai.
+                    if size > 0:
+                        if expected_tp <= entry: expected_tp = round_price_to_tick(entry + tick, symbol)
+                        if expected_sl >= entry: expected_sl = round_price_to_tick(entry - tick, symbol)
+                    else:
+                        if expected_tp >= entry: expected_tp = round_price_to_tick(entry - tick, symbol)
+                        if expected_sl <= entry: expected_sl = round_price_to_tick(entry + tick, symbol)
 
                     final_sl = expected_sl
 
                     # ── Liquidation protection ────────────────────────────
+                    # liq_buffer USD me hai (gold ~4000 ke liye tuned). Low-priced
+                    # symbol pe 0.2 USD = entry ka ~100% ho jaata hai, isliye entry
+                    # ke 0.5% se cap karo (gold ke liye behaviour waisa hi rehta hai).
+                    liq_guard = min(liq_buffer, entry * 0.005)
                     if liq_protect == "Y":
                         try:
                             liquidation_price_raw = pos.get("liquidation_price")
@@ -5152,7 +5268,7 @@ def auto_tp_sl_guardian():
                                 liquidation_price = float(liquidation_price_raw)
                                 if size > 0:
                                     if expected_sl <= liquidation_price:
-                                        final_sl = round_price_2dp(liquidation_price + liq_buffer)
+                                        final_sl = round_price_to_tick(liquidation_price + liq_guard, symbol)
                                         log_system(
                                             f"[LIQ PROTECT] LONG {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/below "
@@ -5161,7 +5277,7 @@ def auto_tp_sl_guardian():
                                         )
                                 else:
                                     if expected_sl >= liquidation_price:
-                                        final_sl = round_price_2dp(liquidation_price - liq_buffer)
+                                        final_sl = round_price_to_tick(liquidation_price - liq_guard, symbol)
                                         log_system(
                                             f"[LIQ PROTECT] SHORT {symbol}: "
                                             f"original_sl={expected_sl:.6f} is at/above "
@@ -5171,6 +5287,13 @@ def auto_tp_sl_guardian():
                         except Exception as liq_err:
                             log_system(f"[LIQ PROTECT] Error for {symbol}: {liq_err} - using original SL")
                             final_sl = expected_sl
+
+                    # SL hamesha entry ke sahi taraf rahe, warna exchange reject
+                    # karega ya stop turant trigger ho jayega.
+                    if size > 0 and final_sl >= entry:
+                        final_sl = round_price_to_tick(entry - tick, symbol)
+                    elif size < 0 and final_sl <= entry:
+                        final_sl = round_price_to_tick(entry + tick, symbol)
 
                     # ── BREAK-EVEN LOGIC (real-time mark price) ───────────
                     with _break_even_applied_lock:
@@ -5200,51 +5323,52 @@ def auto_tp_sl_guardian():
                                     log_system(f"[BE] REST failed, using WS cache for {symbol} = {live_price:.4f}")
 
                             if live_price is not None:
-                                if size > 0:  # LONG
-                                    tp_distance   = expected_tp - entry
-                                    half_distance = tp_distance * be_trig_pct
-                                    be_trigger    = round_price_2dp(entry + half_distance - be_trig_buf)
-                                    be_new_sl     = round_price_2dp(entry + be_profit_off)
-
+                                be_targets = _be_targets(symbol, size, entry, expected_tp, tick,
+                                                         be_trig_pct, be_trig_buf, be_profit_off)
+                                if be_targets is None:
                                     log_throttled(
-                                        log_system, f"be_debug_long_{pos_key}",
-                                        f"[BE DEBUG] {symbol} LONG | live={live_price:.4f} | "
-                                        f"trigger={be_trigger:.4f} | gap={live_price - be_trigger:.4f} | "
-                                        f"new_sl_will_be={be_new_sl:.4f}",
-                                        min_interval=10
+                                        log_system, f"be_not_feasible_{pos_key}",
+                                        f"[BE] {symbol}: TP distance too small for break-even "
+                                        f"(entry={entry} tp={expected_tp} tick={tick}) — skipping BE",
+                                        min_interval=20
                                     )
-
-                                    if live_price >= be_trigger:
-                                        _set_break_even_sl(
-                                            symbol, product_id, size,
-                                            be_new_sl, pos_key,
-                                            direction='long',
-                                            live_price=live_price,
-                                            be_trigger=be_trigger
+                                else:
+                                    be_trigger, be_new_sl = be_targets
+                                    if size > 0:  # LONG
+                                        log_throttled(
+                                            log_system, f"be_debug_long_{pos_key}",
+                                            f"[BE DEBUG] {symbol} LONG | live={live_price:.6f} | "
+                                            f"trigger={be_trigger:.6f} | gap={live_price - be_trigger:.6f} | "
+                                            f"new_sl_will_be={be_new_sl:.6f}",
+                                            min_interval=10
                                         )
 
-                                else:  # SHORT
-                                    tp_distance   = entry - expected_tp
-                                    half_distance = tp_distance * be_trig_pct
-                                    be_trigger    = round_price_2dp(entry - half_distance + be_trig_buf)
-                                    be_new_sl     = round_price_2dp(entry - be_profit_off)
+                                        if live_price >= be_trigger:
+                                            _set_break_even_sl(
+                                                symbol, product_id, size,
+                                                be_new_sl, pos_key,
+                                                direction='long',
+                                                live_price=live_price,
+                                                be_trigger=be_trigger
+                                            )
 
-                                    log_throttled(
-                                        log_system, f"be_debug_short_{pos_key}",
-                                        f"[BE DEBUG] {symbol} SHORT | live={live_price:.4f} | "
-                                        f"trigger={be_trigger:.4f} | gap={be_trigger - live_price:.4f} | "
-                                        f"new_sl_will_be={be_new_sl:.4f}",
-                                        min_interval=10
-                                    )
-
-                                    if live_price <= be_trigger:
-                                        _set_break_even_sl(
-                                            symbol, product_id, size,
-                                            be_new_sl, pos_key,
-                                            direction='short',
-                                            live_price=live_price,
-                                            be_trigger=be_trigger
+                                    else:  # SHORT
+                                        log_throttled(
+                                            log_system, f"be_debug_short_{pos_key}",
+                                            f"[BE DEBUG] {symbol} SHORT | live={live_price:.6f} | "
+                                            f"trigger={be_trigger:.6f} | gap={be_trigger - live_price:.6f} | "
+                                            f"new_sl_will_be={be_new_sl:.6f}",
+                                            min_interval=10
                                         )
+
+                                        if live_price <= be_trigger:
+                                            _set_break_even_sl(
+                                                symbol, product_id, size,
+                                                be_new_sl, pos_key,
+                                                direction='short',
+                                                live_price=live_price,
+                                                be_trigger=be_trigger
+                                            )
                             else:
                                 log_system(f"[BE] No live price available (REST + WS both failed) for {symbol} — skipping BE check this cycle")
 
@@ -5254,7 +5378,10 @@ def auto_tp_sl_guardian():
 
                     # ── TP/SL existence check ─────────────────────────────
                     # Stop TP/SL on Delta sit in state=pending until triggered.
-                    dynamic_tolerance = entry * 0.0005
+                    # Tolerance tick-aware: ADAUSD pe entry*0.0005 (0.0001) khud
+                    # 0.02% TP (0.00004) se bada tha, isliye galat order bhi
+                    # "valid" lagta aur guardian kabhi fix na karta.
+                    dynamic_tolerance = max(float(tick) * 0.5, entry * 0.00004)
 
                     orders_response = make_api_request(
                         'GET',
@@ -5337,12 +5464,12 @@ def auto_tp_sl_guardian():
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id = tp_order.get("id")
-                            log_system(f"[GUARDIAN] EDITING TP order {order_id} → {expected_tp:.2f}")
+                            log_system(f"[GUARDIAN] EDITING TP order {order_id} → {expected_tp:.6f}")
                             edit_payload = {
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(expected_tp),
+                                "stop_price": fmt_price(expected_tp, symbol),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -5354,7 +5481,7 @@ def auto_tp_sl_guardian():
                                     timeout=10
                                 )
                                 if edit_res.status_code == 200:
-                                    log_system(f"[GUARDIAN] TP EDITED → {expected_tp:.2f}")
+                                    log_system(f"[GUARDIAN] TP EDITED → {expected_tp:.6f}")
                                     tp_edited = True
                                     break
                                 log_system(
@@ -5367,12 +5494,12 @@ def auto_tp_sl_guardian():
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id = sl_order.get("id")
-                            log_system(f"[GUARDIAN] EDITING SL order {order_id} → {sl_target:.2f}")
+                            log_system(f"[GUARDIAN] EDITING SL order {order_id} → {sl_target:.6f}")
                             edit_payload = {
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(sl_target),
+                                "stop_price": fmt_price(sl_target, symbol),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -5384,7 +5511,7 @@ def auto_tp_sl_guardian():
                                     timeout=10
                                 )
                                 if edit_res.status_code == 200:
-                                    log_system(f"[GUARDIAN] SL EDITED → {sl_target:.2f}")
+                                    log_system(f"[GUARDIAN] SL EDITED → {sl_target:.6f}")
                                     sl_edited = True
                                     break
                                 log_system(
@@ -5459,18 +5586,18 @@ def auto_tp_sl_guardian():
                         if place_tp:
                             payload["take_profit_order"] = {
                                 "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(expected_tp)
+                                "stop_price": fmt_price(expected_tp, symbol)
                             }
                         if place_sl:
                             payload["stop_loss_order"] = {
                                 "order_type": "market_order",
-                                "stop_price": "{:.2f}".format(sl_target)
+                                "stop_price": fmt_price(sl_target, symbol)
                             }
 
                         log_system(
                             f"[GUARDIAN] Placing missing bracket for {symbol} | "
-                            f"tp={'Y' if place_tp else 'N'}@{expected_tp:.2f} "
-                            f"sl={'Y' if place_sl else 'N'}@{sl_target:.2f}"
+                            f"tp={'Y' if place_tp else 'N'}@{expected_tp:.6f} "
+                            f"sl={'Y' if place_sl else 'N'}@{sl_target:.6f}"
                         )
                         body = json.dumps(payload)
                         try:
@@ -5513,7 +5640,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
     Helper: edit existing SL order to break-even level, or place new bracket SL.
     CHANGE 1: Stores be_new_sl price (float) instead of True in tracker.
     """
-    be_new_sl    = round_price_2dp(be_new_sl)
+    be_new_sl    = round_price_to_tick(be_new_sl, symbol)
     # pending = untriggered stops; open alone misses TP/SL brackets
     orders_be    = make_api_request(
         'GET', f'/orders?product_ids={product_id}&states=open,pending'
@@ -5538,7 +5665,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
             "id":         order_id_be,
             "product_id": int(product_id),
             "order_type": "market_order",
-            "stop_price": "{:.2f}".format(be_new_sl),
+            "stop_price": fmt_price(be_new_sl, symbol),
             "size":       abs(int(size))
         }
         edit_body = json.dumps(edit_payload)
@@ -5571,7 +5698,7 @@ def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
             "product_id": int(product_id),
             "stop_loss_order": {
                 "order_type": "market_order",
-                "stop_price": "{:.2f}".format(be_new_sl)
+                "stop_price": fmt_price(be_new_sl, symbol)
             }
         }
         body_be = json.dumps(payload_be)
